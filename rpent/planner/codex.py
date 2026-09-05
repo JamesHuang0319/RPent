@@ -811,6 +811,85 @@ def build_codex_config(
     return openai_codex.CodexConfig(**kwargs)
 
 
+def run_probe_turn(
+    config: Any,
+    *,
+    prompt: str,
+    model: str | None,
+    timeout_s: int,
+) -> str:
+    """Run one tool-free Codex turn and return its final assistant text.
+
+    Used by the connectivity check. Unlike the planner, which consumes
+    ``turn.stream()`` so it can render a transcript and steer or interrupt
+    mid-turn, a probe only needs the final answer — so it uses the SDK's
+    ``TurnHandle.run()``, which blocks and returns a ``TurnResult``. Note that
+    a ``TurnHandle`` is not itself iterable: the only two ways to consume one
+    are ``.stream()`` and ``.run()``.
+
+    ``run()`` takes no timeout, so the budget is enforced the same way the
+    planner enforces its own: a worker thread joined with a deadline, then
+    :func:`_interrupt` to stop the turn and close the session.
+
+    Any exception the SDK raised is re-raised unchanged, so the caller can
+    classify it rather than seeing it wrapped.
+
+    Args:
+        config: Config from :func:`build_probe_config`.
+        prompt: The probe prompt to send.
+        model: Model id, or ``None`` to use the Codex-configured default.
+        timeout_s: Wall-clock cap for the turn.
+
+    Returns:
+        The turn's final response text, empty if the model produced none.
+
+    Raises:
+        TimeoutError: If the turn does not finish within ``timeout_s``.
+        RuntimeError: If the turn reported ``failed`` or produced no result.
+    """
+    options: dict[str, Any] = {
+        "approval_mode": openai_codex.ApprovalMode.deny_all,
+        "sandbox": openai_codex.Sandbox.read_only,
+    }
+    if model:
+        options["model"] = model
+
+    state: dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            with openai_codex.Codex(config=config) as codex:
+                state["codex"] = codex
+                thread = codex.thread_start(**options)
+                turn = thread.turn(prompt, **options)
+                state["turn"] = turn
+                state["result"] = turn.run()
+        except Exception as exc:  # surfaced to the caller below
+            state["error"] = exc
+
+    worker = threading.Thread(target=_worker, name="codex-probe", daemon=True)
+    worker.start()
+    worker.join(timeout=timeout_s)
+
+    if worker.is_alive():
+        _interrupt(state)
+        worker.join(timeout=15)
+        raise TimeoutError(f"the Codex SDK did not finish within {timeout_s}s.")
+
+    if (exc := state.get("error")) is not None:
+        raise exc
+
+    result = state.get("result")
+    if result is None:
+        raise RuntimeError("the Codex SDK returned no turn result")
+
+    status = str(_get(result, "status", "") or "")
+    if status == "failed":
+        error = _get(result, "error")
+        raise RuntimeError(f"Codex turn failed: {_get(error, 'message', error)}")
+    return str(_get(result, "final_response", "") or "")
+
+
 def build_probe_config(base_url: str | None = None) -> Any:
     """Build a Codex config for the connectivity probe.
 

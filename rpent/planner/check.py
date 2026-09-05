@@ -574,14 +574,21 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
         )
 
     try:
-        from rpent.planner.codex import build_probe_config
+        from rpent.planner.codex import build_probe_config, run_probe_turn
     except ImportError as exc:
         return _result(STATUS_SDK_ERROR, detail=_describe(exc))
 
     timeout_s = request.resolved_timeout_s()
     started = time.monotonic()
     try:
-        reply = _run_codex_probe(build_probe_config(base_url), model, timeout_s)
+        # Turn consumption and timeout/cleanup live in codex.py, next to the
+        # planner's own SDK usage, so both share one set of API assumptions.
+        reply = run_probe_turn(
+            build_probe_config(base_url),
+            prompt=PROBE_PROMPT,
+            model=model,
+            timeout_s=timeout_s,
+        )
     except (asyncio.TimeoutError, TimeoutError):
         return _result(
             STATUS_NETWORK_ERROR,
@@ -603,48 +610,6 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
             latency_s=latency_s,
         )
     return _result(STATUS_OK, reply=reply.strip(), latency_s=latency_s)
-
-
-def _run_codex_probe(config: Any, model: str | None, timeout_s: int) -> str:
-    """Run one Codex turn against ``config`` and return its assistant text."""
-    import openai_codex
-
-    options: dict[str, Any] = {
-        "approval_mode": openai_codex.ApprovalMode.deny_all,
-        "sandbox": openai_codex.Sandbox.read_only,
-    }
-    if model:
-        options["model"] = model
-
-    deadline = time.monotonic() + timeout_s
-    chunks: list[str] = []
-    with openai_codex.Codex(config=config) as codex:
-        thread = codex.thread_start(**options)
-        turn = thread.turn(PROBE_PROMPT, **options)
-        for event in turn:
-            chunks.extend(_codex_event_text(event))
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"the Codex SDK did not finish within {timeout_s}s.")
-    return "".join(chunks)
-
-
-def _codex_event_text(event: Any) -> list[str]:
-    """Extract assistant text from one Codex stream event."""
-    item = getattr(event, "item", None) or event
-    text = getattr(item, "text", None)
-    if isinstance(text, str) and text:
-        return [text]
-    content = getattr(item, "content", None)
-    if isinstance(content, str) and content:
-        return [content]
-    if isinstance(content, list):
-        out: list[str] = []
-        for block in content:
-            block_text = getattr(block, "text", None)
-            if isinstance(block_text, str) and block_text:
-                out.append(block_text)
-        return out
-    return []
 
 
 def _classify_sdk_error(exc: Exception, *, key_present: bool) -> str:

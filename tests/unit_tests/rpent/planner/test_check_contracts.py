@@ -27,6 +27,7 @@ from rpent.planner import check as check_mod
 from rpent.planner.check import (
     CHECK_STATUSES,
     DEFAULT_TIMEOUT_S,
+    PROBE_PROMPT,
     STATUS_AUTH_FAILED,
     STATUS_MISSING_API_KEY,
     STATUS_MISSING_CONFIG,
@@ -460,19 +461,54 @@ def test_codex_probe_runs_without_an_mcp_server(
         seen["base_url"] = base_url
         return object()
 
-    def fake_probe(config: Any, model: str | None, timeout_s: int) -> str:
+    def fake_probe(
+        config: Any, *, prompt: str, model: str | None, timeout_s: int
+    ) -> str:
+        seen["prompt"] = prompt
         seen["model"] = model
         seen["timeout_s"] = timeout_s
         return "ok"
 
     monkeypatch.setattr("rpent.planner.codex.build_probe_config", fake_config)
-    monkeypatch.setattr(check_mod, "_run_codex_probe", fake_probe)
+    monkeypatch.setattr("rpent.planner.codex.run_probe_turn", fake_probe)
     result = check_llm(LlmCheckRequest(planner="codex", model="gpt-5.5"))
 
     assert result.ok is True
     assert seen["model"] == "gpt-5.5"
     assert seen["timeout_s"] == 90
+    assert seen["prompt"] == PROBE_PROMPT
     assert result.credential_env == "CODEX_API_KEY"
+
+
+def test_codex_probe_failure_is_classified_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_probe(config: Any, **kwargs: Any) -> str:
+        raise RuntimeError("HTTP 401 Unauthorized")
+
+    monkeypatch.setattr(
+        "rpent.planner.codex.build_probe_config", lambda base_url=None: object()
+    )
+    monkeypatch.setattr("rpent.planner.codex.run_probe_turn", failing_probe)
+    result = check_llm(LlmCheckRequest(planner="codex"))
+
+    assert result.ok is False
+    assert result.status == STATUS_AUTH_FAILED
+
+
+def test_codex_probe_timeout_reports_network_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timing_out_probe(config: Any, **kwargs: Any) -> str:
+        raise TimeoutError("the Codex SDK did not finish within 90s.")
+
+    monkeypatch.setattr(
+        "rpent.planner.codex.build_probe_config", lambda base_url=None: object()
+    )
+    monkeypatch.setattr("rpent.planner.codex.run_probe_turn", timing_out_probe)
+    result = check_llm(LlmCheckRequest(planner="codex"))
+
+    assert result.status == STATUS_NETWORK_ERROR
 
 
 @pytest.mark.parametrize(
