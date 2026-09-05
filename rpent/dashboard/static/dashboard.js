@@ -28,6 +28,22 @@ const COPY = {
     blankDefault: "(blank = default)",
     defaultPlaceholder: "default",
     startSession: "Start Session",
+    testConnection: "Test connection",
+    checkRunning: "Testing the configured model…",
+    checkOk: (model, latency) => `${model} replied in ${latency}s.`,
+    checkFailed: (reason) => `Check failed: ${reason}`,
+    checkBusy: "A check is already running.",
+    checkStatuses: {
+      missing_config: "the model id is missing or has no provider prefix",
+      unsupported_provider: "that provider prefix is not supported",
+      missing_api_key: "the API key environment variable is not set",
+      auth_failed: "the provider rejected the credential",
+      network_error: "the provider could not be reached",
+      provider_error: "the provider refused the request",
+      sdk_error: "the backend SDK failed",
+    },
+    checkCredential: (name, present) =>
+      `${name} is ${present ? "set" : "not set"}.`,
     liveMonitor: "Live Monitor",
     runtimeLabels: { env: "ENV", vla: "VLA", sam3: "SAM3" },
     runtimeStates: {
@@ -149,6 +165,22 @@ const COPY = {
     blankDefault: "(留空=默认)",
     defaultPlaceholder: "默认",
     startSession: "启动 Session",
+    testConnection: "测试连接",
+    checkRunning: "正在测试所配置的模型…",
+    checkOk: (model, latency) => `${model} 已响应，耗时 ${latency}s。`,
+    checkFailed: (reason) => `检查未通过：${reason}`,
+    checkBusy: "已有一个检查正在进行。",
+    checkStatuses: {
+      missing_config: "模型 id 缺失或没有 provider 前缀",
+      unsupported_provider: "不支持该 provider 前缀",
+      missing_api_key: "未设置 API key 环境变量",
+      auth_failed: "provider 拒绝了该凭据",
+      network_error: "无法连接到 provider",
+      provider_error: "provider 拒绝了本次请求",
+      sdk_error: "后端 SDK 执行失败",
+    },
+    checkCredential: (name, present) =>
+      `${name} ${present ? "已设置" : "未设置"}。`,
     liveMonitor: "实时监控",
     runtimeLabels: { env: "ENV", vla: "VLA", sam3: "SAM3" },
     runtimeStates: {
@@ -1396,6 +1428,65 @@ async function onRun() {
   }
   pollForRun();
 }
+// Reuses collectLaunchConfig() so the tested config is the config that will
+// launch. A failed check never blocks Start Session: it is a diagnostic.
+async function onCheck() {
+  const config = collectLaunchConfig();
+  const panel = $("#llmCheck");
+  const status = $("#llmCheckStatus");
+  const detail = $("#llmCheckDetail");
+
+  panel.hidden = false;
+  status.className = "llm-check-status";
+  status.textContent = copy.checkRunning;
+  detail.hidden = true;
+  detail.textContent = "";
+  $("#checkBtn").disabled = true;
+  $("#runBtn").disabled = true;
+
+  try {
+    const resp = await fetch("/api/llm/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ planner: config.planner, model: config.model }),
+    });
+    if (resp.status === 409) {
+      status.className = "llm-check-status fail";
+      status.textContent = copy.checkBusy;
+      return;
+    }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const result = await resp.json();
+    if (result.ok) {
+      status.className = "llm-check-status ok";
+      status.textContent = copy.checkOk(result.model, result.latency_s ?? "?");
+    } else {
+      const reason = copy.checkStatuses[result.status] || result.status;
+      status.className = "llm-check-status fail";
+      status.textContent = copy.checkFailed(reason);
+      const lines = [];
+      if (result.credential_env) {
+        lines.push(
+          copy.checkCredential(result.credential_env, result.credential_present),
+        );
+      }
+      if (result.detail) lines.push(result.detail);
+      if (lines.length) {
+        detail.textContent = lines.join("\n\n");
+        detail.hidden = false;
+      }
+    }
+  } catch (e) {
+    status.className = "llm-check-status fail";
+    status.textContent = copy.checkFailed(
+      e instanceof Error ? e.message : copy.unknownRequestError,
+    );
+  } finally {
+    $("#checkBtn").disabled = false;
+    $("#runBtn").disabled = false;
+  }
+}
+$("#checkBtn").addEventListener("click", onCheck);
 $("#runBtn").addEventListener("click", onRun);
 $("#f-planner").addEventListener("change", () => {
   launcherModelSelections[activeLauncherPlanner] = selectedModel();

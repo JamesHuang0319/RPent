@@ -79,6 +79,7 @@ def run_dashboard_session(
         port=args.dashboard_port,
         language=args.dashboard_language,
         dashboard_spec=dashboard_spec,
+        llm_check_defaults={"planner": args.planner, "base_url": args.base_url},
     )
     dashboard_url = dashboard_server.start()
     print(

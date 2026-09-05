@@ -65,7 +65,12 @@
       </div>
       <div class="launch-actions">
         <button id="runBtn" data-i18n="startSession">Start Session</button>
+        <button id="checkBtn" class="secondary" data-i18n="testConnection">Test connection</button>
         <span id="launchStatus"></span>
+      </div>
+      <div id="llmCheck" class="llm-check" role="status" aria-live="polite" hidden>
+        <div id="llmCheckStatus" class="llm-check-status"></div>
+        <pre id="llmCheckDetail" class="llm-check-detail" hidden></pre>
       </div>
     </div>
   </div>

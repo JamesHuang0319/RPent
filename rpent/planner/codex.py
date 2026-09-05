@@ -453,25 +453,12 @@ class CodexPlanner:
     # -- config builder ----------------------------------------------------
 
     def _build_config(self, mcp_url: str) -> Any:
-        env = _codex_environment()
-        if self._api_key:
-            env[PROVIDER_ENV_KEY] = self._api_key
-        kwargs: dict[str, Any] = {
-            "config_overrides": tuple(
-                _codex_mcp_config_overrides(
-                    mcp_url=mcp_url,
-                    base_url=self._base_url,
-                )
-            ),
-            "cwd": self._repo_root,
-            "env": env,
-            # use True to support (namespace tools,
-            # web_search, image_generation).
-            "experimental_api": True,
-        }
-        if codex_bin := os.environ.get("CODEX_BIN"):
-            kwargs["codex_bin"] = codex_bin
-        return openai_codex.CodexConfig(**kwargs)
+        return build_codex_config(
+            mcp_url=mcp_url,
+            base_url=self._base_url,
+            api_key=self._api_key,
+            cwd=self._repo_root,
+        )
 
 
 class _CodexDashboardSession:
@@ -787,14 +774,71 @@ class _Recorder:
 # ---------------------------------------------------------------------------
 
 
+def build_codex_config(
+    *,
+    mcp_url: str | None,
+    base_url: str | None,
+    api_key: str | None,
+    cwd: str,
+) -> Any:
+    """Build the Codex SDK config shared by the planner and the check.
+
+    Args:
+        mcp_url: URL of the in-process RPent MCP server, or ``None`` to attach
+            no MCP server at all (used by the connectivity probe).
+        base_url: Custom Responses-compatible endpoint, or ``None``.
+        api_key: Key exported to the child as ``RPENT_CODEX_PROVIDER_KEY``.
+        cwd: Working directory handed to the Codex child process.
+
+    Returns:
+        The ``openai_codex.CodexConfig`` to open a session with.
+    """
+    env = _codex_environment()
+    if api_key:
+        env[PROVIDER_ENV_KEY] = api_key
+    kwargs: dict[str, Any] = {
+        "config_overrides": tuple(
+            _codex_mcp_config_overrides(mcp_url=mcp_url, base_url=base_url)
+        ),
+        "cwd": cwd,
+        "env": env,
+        # use True to support (namespace tools,
+        # web_search, image_generation).
+        "experimental_api": True,
+    }
+    if codex_bin := os.environ.get("CODEX_BIN"):
+        kwargs["codex_bin"] = codex_bin
+    return openai_codex.CodexConfig(**kwargs)
+
+
+def build_probe_config(base_url: str | None = None) -> Any:
+    """Build a Codex config for the connectivity probe.
+
+    Identical to the planner's config except that no MCP server is attached,
+    so the probe starts no in-process HTTP server and exposes no tools.
+
+    Args:
+        base_url: Endpoint override; falls back to ``CODEX_BASE_URL``.
+
+    Returns:
+        The ``openai_codex.CodexConfig`` for a tool-free probe session.
+    """
+    return build_codex_config(
+        mcp_url=None,
+        base_url=base_url or os.environ.get("CODEX_BASE_URL", None),
+        api_key=os.environ.get("CODEX_API_KEY", None),
+        cwd=str(get_repo_root()),
+    )
+
+
 def _codex_mcp_config_overrides(
     *,
-    mcp_url: str,
+    mcp_url: str | None,
     base_url: str | None,
 ) -> list[str]:
-    config: list[tuple[str, Any]] = [
-        ("mcp_servers.rpent.url", mcp_url),
-    ]
+    config: list[tuple[str, Any]] = []
+    if mcp_url:
+        config.append(("mcp_servers.rpent.url", mcp_url))
     if base_url:
         normalized = base_url.rstrip("/")
         if not normalized.endswith("/v1"):

@@ -345,6 +345,24 @@
   #runBtn:active:not(:disabled) { transform: translateY(0); box-shadow: none; }
   #runBtn:disabled { opacity: .55; cursor: default; }
   #launchStatus { color: var(--muted); font-size: 14px; }
+  /* Secondary action: quiet outline so the green primary stays unmistakable. */
+  #checkBtn {
+    background: transparent; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 11px 20px; font-size: 15px; font-weight: 600;
+    cursor: pointer; transition: border-color .16s ease, color .16s ease, opacity .16s ease;
+  }
+  #checkBtn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  #checkBtn:disabled { opacity: .55; cursor: default; }
+  .llm-check { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .llm-check-status { font-size: 14px; color: var(--muted); }
+  .llm-check-status.ok { color: var(--green); }
+  .llm-check-status.fail { color: var(--red); }
+  .llm-check-detail {
+    margin: 0; padding: 10px 12px; max-height: 220px; overflow: auto;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--fg); font-size: 12.5px; line-height: 1.5;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
 
   /* subtle interaction feedback */
   .frame-tabs button:hover {

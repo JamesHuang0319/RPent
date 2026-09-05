@@ -105,6 +105,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     known_robots_text = ", ".join(known_robots) if known_robots else "none"
     ap = argparse.ArgumentParser(
         description="RPent: Agentic Infrastructure for the Physical World",
+        epilog="To verify the LLM backend before starting a run, use "
+        "rpent-check-llm (e.g. rpent-check-llm --planner api "
+        "--model anthropic:claude-opus-4-8).",
         add_help=False,
     )
 
