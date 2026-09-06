@@ -318,6 +318,13 @@
     width: 100%; max-width: 680px; background: var(--panel);
     border: 1px solid var(--border); border-radius: 14px; padding: 32px 34px;
     box-shadow: 0 12px 40px rgba(60,50,40,.18);
+    /* Vertical auto-margins center the card in #launcher's flex row on tall
+       viewports. Per the flexbox spec, auto margins only ever absorb
+       *positive* free space — they resolve to 0 rather than negative — so a
+       card taller than the viewport falls back to flush-top, fully
+       scrollable, with nothing clipped. Universally supported (no reliance
+       on the newer, inconsistently-implemented `align-items: safe center`). */
+    margin: auto 0;
   }
   .launch-card h2 { margin: 0 0 4px; font-size: 22px; font-weight: 600; }
   .launch-card h2 .dot { color: var(--accent); }
@@ -338,6 +345,8 @@
   #runBtn {
     background: var(--green); color: #07210e; border: none; border-radius: 8px;
     padding: 12px 30px; font-size: 16px; font-weight: 700; cursor: pointer; letter-spacing: .3px;
+    /* Fixed so zh/en label-length differences don't shift the button row. */
+    min-width: 180px; text-align: center;
     transition: background-color .16s ease, color .16s ease, box-shadow .16s ease,
       opacity .16s ease, transform .16s ease;
   }
@@ -350,13 +359,22 @@
     background: transparent; color: var(--fg); border: 1px solid var(--border);
     border-radius: 8px; padding: 11px 20px; font-size: 15px; font-weight: 600;
     cursor: pointer; transition: border-color .16s ease, color .16s ease, opacity .16s ease;
+    /* Fixed so zh/en label-length differences don't shift the button row. */
+    min-width: 168px; text-align: center;
   }
   #checkBtn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
   #checkBtn:disabled { opacity: .55; cursor: default; }
-  .llm-check { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
-  .llm-check-status { font-size: 14px; color: var(--muted); }
+  /* Same rhythm as .lform -> .launch-actions (24px) instead of a smaller one-off value. */
+  .llm-check { margin-top: 24px; display: flex; flex-direction: column; gap: 8px; }
+  .llm-check-status { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }
   .llm-check-status.ok { color: var(--green); }
   .llm-check-status.fail { color: var(--red); }
+  .llm-check-spin {
+    flex: none; width: 13px; height: 13px; border-radius: 50%;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    animation: llm-check-spin .8s linear infinite;
+  }
+  @keyframes llm-check-spin { to { transform: rotate(360deg); } }
   .llm-check-detail {
     margin: 0; padding: 10px 12px; max-height: 220px; overflow: auto;
     background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
@@ -383,7 +401,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .b-starting, .b-running { animation: none; }
+    .b-starting, .b-running, .llm-check-spin { animation: none; }
     .badge, .runtime-item, .gutter, .tg-head, .step, .composer textarea,
     .withdraw-message, .suite-suggestion,
     .frame-tabs button, #runBtn { transition: none; }

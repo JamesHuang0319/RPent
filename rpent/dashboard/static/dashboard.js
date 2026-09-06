@@ -29,7 +29,7 @@ const COPY = {
     defaultPlaceholder: "default",
     startSession: "Start Session",
     testConnection: "Test connection",
-    checkRunning: "Testing the configured model…",
+    checkRunning: (s) => `Testing the configured model… (${s}s)`,
     checkOk: (model, latency) => `${model} replied in ${latency}s.`,
     checkFailed: (reason) => `Check failed: ${reason}`,
     checkBusy: "A check is already running.",
@@ -166,7 +166,7 @@ const COPY = {
     defaultPlaceholder: "默认",
     startSession: "启动 Session",
     testConnection: "测试连接",
-    checkRunning: "正在测试所配置的模型…",
+    checkRunning: (s) => `正在测试所配置的模型…（${s}s）`,
     checkOk: (model, latency) => `${model} 已响应，耗时 ${latency}s。`,
     checkFailed: (reason) => `检查未通过：${reason}`,
     checkBusy: "已有一个检查正在进行。",
@@ -1428,21 +1428,49 @@ async function onRun() {
   }
   pollForRun();
 }
+// Bumped on every reset and on every new check, so a check whose config has
+// since changed (or a second check started) can tell its own response is
+// stale and skip touching the DOM instead of showing a mismatched result.
+let llmCheckGeneration = 0;
+
+// Hides any previous result and invalidates whichever check is in flight.
+// Called both when planner/model change and at the top of a new check.
+function resetLlmCheck() {
+  llmCheckGeneration += 1;
+  $("#llmCheck").hidden = true;
+  $("#llmCheckStatus").className = "llm-check-status";
+  $("#llmCheckStatusText").textContent = "";
+  $("#llmCheckSpin").hidden = true;
+  const detail = $("#llmCheckDetail");
+  detail.hidden = true;
+  detail.textContent = "";
+}
+
 // Reuses collectLaunchConfig() so the tested config is the config that will
 // launch. A failed check never blocks Start Session: it is a diagnostic.
 async function onCheck() {
+  resetLlmCheck();
+  const myGeneration = llmCheckGeneration;
   const config = collectLaunchConfig();
   const panel = $("#llmCheck");
   const status = $("#llmCheckStatus");
+  const statusText = $("#llmCheckStatusText");
+  const spinEl = $("#llmCheckSpin");
   const detail = $("#llmCheckDetail");
 
   panel.hidden = false;
-  status.className = "llm-check-status";
-  status.textContent = copy.checkRunning;
-  detail.hidden = true;
-  detail.textContent = "";
   $("#checkBtn").disabled = true;
   $("#runBtn").disabled = true;
+
+  let elapsedS = 0;
+  spinEl.hidden = false;
+  statusText.textContent = copy.checkRunning(elapsedS);
+  const timer = setInterval(() => {
+    elapsedS += 1;
+    if (myGeneration === llmCheckGeneration) {
+      statusText.textContent = copy.checkRunning(elapsedS);
+    }
+  }, 1000);
 
   try {
     const resp = await fetch("/api/llm/check", {
@@ -1450,20 +1478,22 @@ async function onCheck() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ planner: config.planner, model: config.model }),
     });
+    if (myGeneration !== llmCheckGeneration) return; // config changed mid-flight
     if (resp.status === 409) {
       status.className = "llm-check-status fail";
-      status.textContent = copy.checkBusy;
+      statusText.textContent = copy.checkBusy;
       return;
     }
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const result = await resp.json();
+    if (myGeneration !== llmCheckGeneration) return;
     if (result.ok) {
       status.className = "llm-check-status ok";
-      status.textContent = copy.checkOk(result.model, result.latency_s ?? "?");
+      statusText.textContent = copy.checkOk(result.model, result.latency_s ?? "?");
     } else {
       const reason = copy.checkStatuses[result.status] || result.status;
       status.className = "llm-check-status fail";
-      status.textContent = copy.checkFailed(reason);
+      statusText.textContent = copy.checkFailed(reason);
       const lines = [];
       if (result.credential_env) {
         lines.push(
@@ -1477,11 +1507,17 @@ async function onCheck() {
       }
     }
   } catch (e) {
-    status.className = "llm-check-status fail";
-    status.textContent = copy.checkFailed(
-      e instanceof Error ? e.message : copy.unknownRequestError,
-    );
+    if (myGeneration === llmCheckGeneration) {
+      status.className = "llm-check-status fail";
+      statusText.textContent = copy.checkFailed(
+        e instanceof Error ? e.message : copy.unknownRequestError,
+      );
+    }
   } finally {
+    clearInterval(timer);
+    if (myGeneration === llmCheckGeneration) {
+      spinEl.hidden = true;
+    }
     $("#checkBtn").disabled = false;
     $("#runBtn").disabled = false;
   }
@@ -1496,7 +1532,10 @@ $("#f-planner").addEventListener("change", () => {
     launcherModelSelections[activeLauncherPlanner],
   );
   updatePlannerFields();
+  resetLlmCheck();
 });
+$("#f-model_preset").addEventListener("change", resetLlmCheck);
+$("#f-model_custom").addEventListener("input", resetLlmCheck);
 
 async function boot() {
   applyStaticCopy();
