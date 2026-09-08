@@ -246,6 +246,111 @@ def test_shared_cli_validation_stops_before_robot_runtime(
     assert parse_called is False
 
 
+# ---------------------------------------------------------------------------
+# Pre-flight LLM check
+#
+# Starting the env, VLA and perception servers costs minutes and GPUs, and all
+# of them boot before the first model call. The pre-flight moves that failure
+# to the front.
+# ---------------------------------------------------------------------------
+
+
+def _preflight_argv(tmp_path: Path) -> list[str]:
+    return [
+        "rpent",
+        "--robot",
+        "libero",
+        "--suite",
+        "libero_object",
+        "--task",
+        "0",
+        "--planner",
+        "api",
+        "--model",
+        "anthropic:m",
+        "--output-dir",
+        str(tmp_path),
+    ]
+
+
+def test_a_failing_preflight_stops_before_any_robot_service_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    cli = _cli_module()
+    from rpent.planner.check import STATUS_AUTH_FAILED, LlmCheckResult
+
+    def refuse(request: Any) -> LlmCheckResult:
+        return LlmCheckResult(
+            ok=False,
+            status=STATUS_AUTH_FAILED,
+            planner="api",
+            model="anthropic:m",
+            credential_env="ANTHROPIC_API_KEY",
+            detail="the provider rejected the credential.",
+        )
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("nothing may start after a failed pre-flight")
+
+    monkeypatch.setattr("rpent.planner.check.check_llm", refuse)
+    monkeypatch.setattr("rpent.memory.MemoryManager.sync", explode)
+    monkeypatch.setattr(sys, "argv", _preflight_argv(tmp_path))
+
+    assert cli.main() == 1
+    err = capsys.readouterr().err
+    assert "auth_failed" in err
+    assert "No robot service was started" in err
+
+
+def test_the_preflight_verifies_images_and_tools_not_just_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A run always sends images and tool schemas, so the pre-flight must too."""
+    cli = _cli_module()
+    from rpent.planner.check import STATUS_OK, LlmCheckResult
+
+    seen: dict[str, Any] = {}
+
+    def capture(request: Any) -> LlmCheckResult:
+        seen["request"] = request
+        return LlmCheckResult(ok=True, status=STATUS_OK, planner="api", reply="ok")
+
+    def stop_here(*args: Any, **kwargs: Any) -> Any:
+        raise ConfigCaptured
+
+    monkeypatch.setattr("rpent.planner.check.check_llm", capture)
+    monkeypatch.setattr("rpent.memory.MemoryManager.sync", stop_here)
+    monkeypatch.setattr(sys, "argv", _preflight_argv(tmp_path))
+
+    with pytest.raises(ConfigCaptured):
+        cli.main()
+
+    assert seen["request"].deep is True
+    assert seen["request"].planner == "api"
+    assert seen["request"].model == "anthropic:m"
+
+
+def test_skip_llm_check_bypasses_the_probe_entirely(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cli = _cli_module()
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("--skip-llm-check must not probe the backend")
+
+    def stop_here(*args: Any, **kwargs: Any) -> Any:
+        raise ConfigCaptured
+
+    monkeypatch.setattr("rpent.planner.check.check_llm", explode)
+    monkeypatch.setattr("rpent.memory.MemoryManager.sync", stop_here)
+    monkeypatch.setattr(sys, "argv", [*_preflight_argv(tmp_path), "--skip-llm-check"])
+
+    with pytest.raises(ConfigCaptured):
+        cli.main()
+
+
 def test_transcript_serialization_strips_nested_images_without_mutating_input() -> None:
     cli = _cli_module()
     messages = [
@@ -443,6 +548,8 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
             "rpent",
             "--robot",
             "libero",
+            # The planner is stubbed, so there is no backend to pre-flight.
+            "--skip-llm-check",
             "--explore",
             "--auto-merge-memory",
             "--memory-profile",
@@ -580,6 +687,8 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
             "rpent",
             "--robot",
             "testrobot",
+            # The planner is stubbed, so there is no backend to pre-flight.
+            "--skip-llm-check",
             "--task-name",
             "OpenDrawer",
             "--seed",

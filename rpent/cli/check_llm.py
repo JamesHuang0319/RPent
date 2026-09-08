@@ -28,12 +28,14 @@ from rpent.planner.check import (
     CHECK_PLANNERS,
     DEFAULT_TIMEOUT_S,
     STATUS_AUTH_FAILED,
+    STATUS_IMAGE_REJECTED,
     STATUS_INVALID_MODEL,
     STATUS_MISSING_API_KEY,
     STATUS_MISSING_CONFIG,
     STATUS_NETWORK_ERROR,
     STATUS_PROVIDER_ERROR,
     STATUS_SDK_ERROR,
+    STATUS_TOOL_CALLS_UNSUPPORTED,
     STATUS_UNSUPPORTED_PROVIDER,
     LlmCheckRequest,
     LlmCheckResult,
@@ -77,6 +79,14 @@ def _parser() -> argparse.ArgumentParser:
         help=f"Wall-clock cap for the check. Defaults per backend ({default_timeouts}).",
     )
     parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Also verify that the endpoint accepts an image and that the "
+        "model calls a tool -- both of which every real run needs. "
+        "Applies to the 'api' planner; the SDK backends own their own "
+        "request shape and run the same probe either way.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         dest="as_json",
@@ -85,7 +95,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _remediation(result: LlmCheckResult) -> str:
+def remediation(result: LlmCheckResult) -> str:
     """Return terminal-facing advice for a failed check.
 
     The shared check layer stays UI-agnostic, so the wording lives here.
@@ -107,6 +117,14 @@ def _remediation(result: LlmCheckResult) -> str:
             "Use a provider RPent installs: anthropic:, openai:, or openai-chat:."
         ),
         STATUS_MISSING_API_KEY: f"Set {credential} in this shell, then retry.",
+        STATUS_IMAGE_REJECTED: (
+            "The endpoint refused image input, which every RPent run sends. "
+            "Use a multimodal model, or run with --no-images."
+        ),
+        STATUS_TOOL_CALLS_UNSUPPORTED: (
+            "The model did not call the offered tool. RPent drives every robot "
+            "action through tool calls, so pick a model that supports them."
+        ),
         STATUS_INVALID_MODEL: (
             f"The provider rejected the model id. Check that --model exists "
             f"for this backend and that {credential} has access to it."
@@ -131,7 +149,7 @@ def _remediation(result: LlmCheckResult) -> str:
     return hints.get(result.status, "")
 
 
-def _render(result: LlmCheckResult) -> str:
+def render_report(result: LlmCheckResult) -> str:
     """Render a check result as an aligned terminal report.
 
     Args:
@@ -158,7 +176,7 @@ def _render(result: LlmCheckResult) -> str:
         rows.append(("FAILED", result.status))
         if result.detail:
             rows.append(("detail", result.detail))
-        if hint := _remediation(result):
+        if hint := remediation(result):
             rows.append(("hint", hint))
 
     width = max(len(label) for label, _ in rows)
@@ -180,12 +198,13 @@ def main() -> int:
             model=args.model,
             base_url=args.base_url,
             timeout_s=args.timeout_s,
+            deep=args.deep,
         )
     )
     if args.as_json:
         print(json.dumps(result.as_dict(), indent=2, ensure_ascii=False))
     else:
-        print(_render(result))
+        print(render_report(result))
     return 0 if result.ok else 1
 
 

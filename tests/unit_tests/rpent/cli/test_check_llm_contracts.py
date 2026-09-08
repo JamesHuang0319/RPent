@@ -207,7 +207,7 @@ def test_every_failure_status_has_remediation_text() -> None:
     for status in CHECK_STATUSES:
         if status == STATUS_OK:
             continue
-        hint = check_cli._remediation(
+        hint = check_cli.remediation(
             LlmCheckResult(ok=False, status=status, planner="api")
         )
         assert hint, f"no remediation text for {status}"

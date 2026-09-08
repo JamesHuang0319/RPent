@@ -182,6 +182,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
 
     # other config
+    ap.add_argument(
+        "--skip-llm-check",
+        action="store_true",
+        help="Skip the pre-flight LLM backend check. The check runs before "
+        "any robot service starts, so a bad key fails in seconds instead "
+        "of after the env/VLA/perception servers have booted.",
+    )
     ap.add_argument("--output-dir", default=None)
     ap.add_argument(
         "--memory-profile",
@@ -236,6 +243,46 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
 
     return ap
+
+
+def _llm_backend_ready(args) -> bool:
+    """Probe the configured LLM backend before any robot service starts.
+
+    Args:
+        args: Parsed CLI arguments carrying planner, model and base URL.
+
+    Returns:
+        True when the backend answered. On failure the report and its
+        remediation hint are printed, and the caller should exit non-zero.
+    """
+    from rpent.cli.check_llm import render_report
+    from rpent.planner.check import LlmCheckRequest, check_llm
+
+    result = check_llm(
+        LlmCheckRequest(
+            planner=args.planner,
+            model=args.model,
+            base_url=args.base_url,
+            # A run always sends images and tool schemas, so the pre-flight
+            # verifies the same thing rather than only authentication.
+            deep=True,
+        )
+    )
+    if result.ok:
+        logger.info(
+            "llm backend ok: %s replied in %ss",
+            result.model or args.planner,
+            result.latency_s,
+        )
+        return True
+    logger.error("llm backend check failed: %s", result.status)
+    print(render_report(result), file=sys.stderr)
+    print(
+        "\nNo robot service was started. Fix the above, or pass "
+        "--skip-llm-check to run anyway.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _handoff_message(output_dir, session_number: int, session_max: int) -> str:
@@ -350,6 +397,12 @@ def main() -> int:
     # mkdir + logging wiring (robot-side already picked the path).
     output_dir = init_output_dir(output_dir, verbose=args.verbose)
     logger.info("physical agent cmd: %s", shlex.join([sys.executable, *sys.argv]))
+
+    # Pre-flight before anything expensive: starting the env, VLA and
+    # perception servers costs minutes and GPUs, and every one of them boots
+    # before the first model call would have surfaced a bad key.
+    if not args.skip_llm_check and not _llm_backend_ready(args):
+        return 1
 
     memory_profile = getattr(args, "memory_profile", "hf")
     if not getattr(args, "explore", False) and memory_profile == "hf":

@@ -27,6 +27,7 @@ Human-readable remediation text belongs to the CLI and the Dashboard, not here.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import re
 import subprocess
@@ -56,6 +57,10 @@ STATUS_MISSING_API_KEY = "missing_api_key"
 STATUS_AUTH_FAILED = "auth_failed"
 #: The provider was reached and rejected the model id (HTTP 400).
 STATUS_INVALID_MODEL = "invalid_model"
+#: The endpoint refused image content (deep probe only).
+STATUS_IMAGE_REJECTED = "image_rejected"
+#: The model never called the offered tool (deep probe only).
+STATUS_TOOL_CALLS_UNSUPPORTED = "tool_calls_unsupported"
 #: DNS, connection, TLS failure, or a timeout.
 STATUS_NETWORK_ERROR = "network_error"
 #: The provider was reached and refused (404, 429, 5xx, ...).
@@ -71,6 +76,8 @@ CHECK_STATUSES = (
     STATUS_MISSING_API_KEY,
     STATUS_AUTH_FAILED,
     STATUS_INVALID_MODEL,
+    STATUS_IMAGE_REJECTED,
+    STATUS_TOOL_CALLS_UNSUPPORTED,
     STATUS_NETWORK_ERROR,
     STATUS_PROVIDER_ERROR,
     STATUS_SDK_ERROR,
@@ -108,8 +115,27 @@ _KEYCHAIN_SERVICES = {"claude_code": "Claude Code-credentials"}
 #: The smallest prompt that still proves the model answered.
 PROBE_PROMPT = "Reply with the single word: ok"
 
+#: Deep-probe prompt. The model is asked to call the tool, not to describe
+#: the image: the point is that the endpoint *accepted* an image block and
+#: that tool calling works, not that the model sees well.
+DEEP_PROBE_PROMPT = (
+    "Call the probe_ok tool with note set to ok. An image is attached; "
+    "you do not need to describe it."
+)
+
+#: A 1x1 transparent PNG (68 bytes) -- the smallest image that still makes
+#: the request carry a real image block.
+PROBE_IMAGE_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+PROBE_IMAGE_MEDIA_TYPE = "image/png"
+
 #: Output cap for the probe. Large enough for a word, small enough to be free.
 PROBE_MAX_TOKENS = 16
+
+#: The deep probe must fit a whole tool call, not one word.
+DEEP_PROBE_MAX_TOKENS = 256
 
 #: Advisory only: names the env var in an error before pydantic-ai is asked to
 #: resolve it. An unmapped prefix skips the pre-flight and falls through to
@@ -159,12 +185,17 @@ class LlmCheckRequest:
             optional for ``claude_code`` and ``codex``.
         base_url: Base URL overriding the backend's own env var.
         timeout_s: Wall-clock cap. Defaults per backend when ``None``.
+        deep: Also verify that the endpoint accepts an image block and that
+            the model calls a tool. Only the ``api`` planner can vary here;
+            the two SDK backends own their own request shape, so they run
+            the same probe either way and say so in ``extra``.
     """
 
     planner: str = "api"
     model: str | None = None
     base_url: str | None = None
     timeout_s: int | None = None
+    deep: bool = False
 
     def resolved_timeout_s(self) -> int:
         """Return the effective timeout, applying the per-backend default."""
@@ -505,15 +536,25 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
         return _result(STATUS_UNSUPPORTED_PROVIDER, detail=_describe(exc))
 
     timeout_s = request.resolved_timeout_s()
-    logger.info("probe budget: %ds", timeout_s)
+    logger.info("probe budget: %ds (deep=%s)", timeout_s, request.deep)
     started = time.monotonic()
     try:
-        reply = asyncio.run(
-            asyncio.wait_for(
-                _run_api_probe(Agent, ModelSettings, api_model),
-                timeout=timeout_s,
+        if request.deep:
+            tool_called = asyncio.run(
+                asyncio.wait_for(
+                    _run_api_deep_probe(Agent, ModelSettings, api_model),
+                    timeout=timeout_s,
+                )
             )
-        )
+            reply = "ok" if tool_called else ""
+        else:
+            tool_called = True
+            reply = asyncio.run(
+                asyncio.wait_for(
+                    _run_api_probe(Agent, ModelSettings, api_model),
+                    timeout=timeout_s,
+                )
+            )
     except (asyncio.TimeoutError, TimeoutError):
         return _result(
             STATUS_NETWORK_ERROR,
@@ -521,8 +562,14 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
             latency_s=round(time.monotonic() - started, 3),
         )
     except ModelHTTPError as exc:
+        status = _classify_http_status(exc.status_code)
+        if request.deep and _is_image_rejection(exc, exc.status_code):
+            # Checked before the generic 4xx mapping: an endpoint that
+            # refuses images reports it as a plain 400, which would
+            # otherwise read as a bad model id.
+            status = STATUS_IMAGE_REJECTED
         return _result(
-            _classify_http_status(exc.status_code),
+            status,
             detail=_describe(exc),
             latency_s=round(time.monotonic() - started, 3),
         )
@@ -536,13 +583,28 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
         )
 
     latency_s = round(time.monotonic() - started, 3)
+    if request.deep and not tool_called:
+        return _result(
+            STATUS_TOOL_CALLS_UNSUPPORTED,
+            detail=(
+                "the endpoint accepted the request but the model never called "
+                "the offered tool; RPent drives every robot action through "
+                "tool calls."
+            ),
+            latency_s=latency_s,
+        )
     if not reply.strip():
         return _result(
             STATUS_PROVIDER_ERROR,
             detail="the provider returned an empty response.",
             latency_s=latency_s,
         )
-    return _result(STATUS_OK, reply=reply.strip(), latency_s=latency_s)
+    return _result(
+        STATUS_OK,
+        reply=reply.strip(),
+        latency_s=latency_s,
+        extra={"deep": True} if request.deep else {},
+    )
 
 
 async def _run_api_probe(agent_cls: Any, settings_cls: Any, api_model: Any) -> str:
@@ -553,6 +615,72 @@ async def _run_api_probe(agent_cls: Any, settings_cls: Any, api_model: Any) -> s
         model_settings=settings_cls(max_tokens=PROBE_MAX_TOKENS),
     )
     return str(result.output or "")
+
+
+async def _run_api_deep_probe(
+    agent_cls: Any,
+    settings_cls: Any,
+    api_model: Any,
+) -> bool:
+    """Send one image block plus one tool and report whether the tool ran.
+
+    A planner run always carries images and tool schemas, so a text-only
+    probe can pass against an endpoint the real run cannot use. This sends
+    the smallest request that still exercises both.
+
+    Args:
+        agent_cls: ``pydantic_ai.Agent``.
+        settings_cls: ``pydantic_ai.ModelSettings``.
+        api_model: The resolved model instance.
+
+    Returns:
+        True when the model invoked the offered tool.
+    """
+    from pydantic_ai.messages import BinaryContent
+
+    def probe_ok(note: str) -> str:
+        """Acknowledge the probe."""
+        return "ok"
+
+    agent = agent_cls(api_model, tools=[probe_ok])
+    prompt = [
+        DEEP_PROBE_PROMPT,
+        BinaryContent(data=PROBE_IMAGE_PNG, media_type=PROBE_IMAGE_MEDIA_TYPE),
+    ]
+    # Stop at the first model response instead of running the tool loop to
+    # completion: one request answers the question, and a model that keeps
+    # re-calling the tool would otherwise spend the agent's whole request
+    # budget on a diagnostic.
+    async with agent.iter(
+        prompt,
+        model_settings=settings_cls(max_tokens=DEEP_PROBE_MAX_TOKENS),
+    ) as run:
+        async for node in run:
+            if agent_cls.is_call_tools_node(node):
+                return any(
+                    type(part).__name__ == "ToolCallPart"
+                    for part in node.model_response.parts
+                )
+    return False
+
+
+def _is_image_rejection(exc: Exception, status_code: int | None) -> bool:
+    """Whether a 4xx names image content as the thing it refused.
+
+    Mirrors the run-time detector in :mod:`rpent.planner.api_loop`, which
+    exists because text-only OpenAI-compatible endpoints answer an image
+    block with ``message type 'image_url' is not supported``.
+
+    Args:
+        exc: The provider error.
+        status_code: Its HTTP status, when known.
+
+    Returns:
+        True when the failure is about the image, not the model or the key.
+    """
+    if status_code is None or not 400 <= status_code < 500:
+        return False
+    return "image" in str(exc).lower()
 
 
 def _classify_http_status(status_code: int | None) -> str:
@@ -626,6 +754,11 @@ def _check_claude_code(request: LlmCheckRequest) -> LlmCheckResult:
     key_present = bool(os.environ.get(_CLAUDE_CODE_KEY_ENV))
 
     def _result(status: str, **kwargs: Any) -> LlmCheckResult:
+        if request.deep:
+            # The SDK owns its own request shape; RPent cannot inject an image
+            # or a tool into the probe turn. Say so rather than implying
+            # coverage it does not have.
+            kwargs.setdefault("extra", {})["deep"] = "not applicable to this backend"
         return LlmCheckResult(
             ok=status == STATUS_OK,
             status=status,
@@ -799,6 +932,11 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
     base_url = request.base_url or os.environ.get(_CODEX_BASE_URL_ENV) or None
 
     def _result(status: str, **kwargs: Any) -> LlmCheckResult:
+        if request.deep:
+            # The SDK owns its own request shape; RPent cannot inject an image
+            # or a tool into the probe turn. Say so rather than implying
+            # coverage it does not have.
+            kwargs.setdefault("extra", {})["deep"] = "not applicable to this backend"
         return LlmCheckResult(
             ok=status == STATUS_OK,
             status=status,

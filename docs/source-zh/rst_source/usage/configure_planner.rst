@@ -143,8 +143,9 @@ RPent 通过 SDK 创建进程内 MCP 服务，并把 toolkit 的工具注册到
 
 成功时退出码为 ``0``，任何失败为 ``1``，并将失败归类为
 ``missing_config``、``unsupported_provider``、``missing_api_key``、
-``auth_failed``、``invalid_model``、``network_error``、
-``provider_error``、``sdk_error`` 之一。脚本与 CI 建议使用 ``--json``。
+``auth_failed``、``invalid_model``、``image_rejected``、
+``tool_calls_unsupported``、``network_error``、``provider_error``、
+``sdk_error`` 之一。脚本与 CI 建议使用 ``--json``。
 ``--base-url`` 覆盖后端端点，``--timeout-s`` 覆盖诊断超时（``api`` 为
 30 秒，两个 SDK 后端为 90 秒；运行时的 ``1200`` 秒默认值不会被复用）。
 
@@ -158,8 +159,21 @@ Dashboard 提供同一项检查：启动页的 **测试连接** 按钮会针对�
 要使用的配置完全一致。两个前端调用的是 ``rpent.planner.check`` 中的同
 一份实现。
 
-检查通过只能证明认证与网络可达。它并不能证明模型会接受图像块
-（参见 ``--no-images``）、你的工具 schema，或你的上下文长度。
+加 ``--deep`` 可以额外验证真实运行必然会发送的两样东西：此时请求会带上一张
+1x1 图像并提供一个工具，于是拒绝图像输入的端点会报 ``image_rejected``，不调用
+工具的模型会报 ``tool_calls_unsupported``。只有 ``api`` planner 会因此改变行为
+—— ``claude_code`` 与 ``codex`` 自己掌控请求形态，两种模式下跑的是同一个探测，
+结果里会写明 ``"deep": "not applicable to this backend"``，而不是假装覆盖到了。
+
+检查通过仍不能证明你的上下文长度够用，或完整的工具 schema 能正确序列化。
+
+每次运行前的自动预检
+~~~~~~~~~~~~~~~~~~~~
+
+``rpent`` 会在启动 env、VLA、感知服务之前自动跑同一项检查（deep 模式）。这些
+服务要花几分钟并占住 GPU，而且全都在第一次模型调用之前就启动完毕；只要 key
+配错一次，这个预检就已经回本。检查失败会打印报告并直接退出，不启动任何服务。
+加 ``--skip-llm-check`` 可以跳过。
 
 .. _planner-custom:
 

@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 import pytest
 from pydantic_ai.exceptions import ModelHTTPError, UserError
-from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 
 from rpent.planner import check as check_mod
@@ -31,6 +31,7 @@ from rpent.planner.check import (
     NO_CREDENTIAL_TIMEOUT_S,
     PROBE_PROMPT,
     STATUS_AUTH_FAILED,
+    STATUS_IMAGE_REJECTED,
     STATUS_INVALID_MODEL,
     STATUS_MISSING_API_KEY,
     STATUS_MISSING_CONFIG,
@@ -38,6 +39,7 @@ from rpent.planner.check import (
     STATUS_OK,
     STATUS_PROVIDER_ERROR,
     STATUS_SDK_ERROR,
+    STATUS_TOOL_CALLS_UNSUPPORTED,
     STATUS_UNSUPPORTED_PROVIDER,
     LlmCheckRequest,
     check_llm,
@@ -110,6 +112,8 @@ def test_every_status_is_declared_in_the_public_tuple() -> None:
         STATUS_MISSING_API_KEY,
         STATUS_AUTH_FAILED,
         STATUS_INVALID_MODEL,
+        STATUS_IMAGE_REJECTED,
+        STATUS_TOOL_CALLS_UNSUPPORTED,
         STATUS_NETWORK_ERROR,
         STATUS_PROVIDER_ERROR,
         STATUS_SDK_ERROR,
@@ -533,6 +537,132 @@ def test_codex_probe_timeout_reports_network_error(
     result = check_llm(LlmCheckRequest(planner="codex"))
 
     assert result.status == STATUS_NETWORK_ERROR
+
+
+# ---------------------------------------------------------------------------
+# The deep probe
+#
+# A planner run always carries images and tool schemas. A text-only probe can
+# therefore pass against an endpoint the real run cannot use -- which is why
+# --no-images exists at all.
+# ---------------------------------------------------------------------------
+
+
+def _tool_calling_model(call_tool: bool) -> FunctionModel:
+    """Return a model that either calls the offered tool or just talks."""
+
+    def respond(messages: Any, info: Any) -> ModelResponse:
+        already_called = any(
+            type(part).__name__ == "ToolCallPart"
+            for message in messages
+            for part in getattr(message, "parts", ())
+        )
+        if call_tool and not already_called:
+            return ModelResponse(parts=[ToolCallPart("probe_ok", {"note": "ok"})])
+        return ModelResponse(parts=[TextPart("ok")])
+
+    return FunctionModel(respond)
+
+
+def test_the_deep_probe_sends_an_image_and_a_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    seen: dict[str, Any] = {}
+
+    def respond(messages: Any, info: Any) -> ModelResponse:
+        seen.setdefault(
+            "content_types",
+            [
+                type(item).__name__
+                for message in messages
+                for part in getattr(message, "parts", ())
+                if isinstance(getattr(part, "content", None), list)
+                for item in part.content
+            ],
+        )
+        seen["tools"] = [t.name for t in (info.function_tools or [])]
+        return ModelResponse(parts=[ToolCallPart("probe_ok", {"note": "ok"})])
+
+    _patch_model(monkeypatch, FunctionModel(respond))
+    result = check_llm(LlmCheckRequest(planner="api", model="anthropic:m", deep=True))
+
+    assert result.status == STATUS_OK
+    assert "BinaryContent" in seen["content_types"]
+    assert "probe_ok" in seen["tools"]
+    assert result.as_dict()["deep"] is True
+
+
+def test_a_model_that_never_calls_the_tool_is_not_a_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    _patch_model(monkeypatch, _tool_calling_model(call_tool=False))
+
+    result = check_llm(LlmCheckRequest(planner="api", model="anthropic:m", deep=True))
+
+    assert result.status == STATUS_TOOL_CALLS_UNSUPPORTED
+
+
+def test_an_endpoint_refusing_images_is_named_as_such(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Text-only OpenAI-compatible endpoints answer an image block with a 400.
+
+    Reporting that as ``invalid_model`` would send people to change the model
+    id when the fix is --no-images or a multimodal model.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    _patch_model(
+        monkeypatch,
+        _raising_model(
+            ModelHTTPError(
+                status_code=400,
+                model_name="m",
+                body="message type 'image_url' is not supported",
+            )
+        ),
+    )
+
+    result = check_llm(LlmCheckRequest(planner="api", model="anthropic:m", deep=True))
+
+    assert result.status == STATUS_IMAGE_REJECTED
+
+
+def test_a_shallow_probe_never_reports_image_or_tool_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without --deep the probe sends no image, so it cannot blame one."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    _patch_model(monkeypatch, _tool_calling_model(call_tool=False))
+
+    result = check_llm(LlmCheckRequest(planner="api", model="anthropic:m"))
+
+    assert result.status == STATUS_OK
+    assert "deep" not in result.as_dict()
+
+
+@pytest.mark.parametrize("planner", ["claude_code", "codex"])
+def test_the_sdk_backends_say_deep_does_not_apply(
+    monkeypatch: pytest.MonkeyPatch, planner: str
+) -> None:
+    """Claiming coverage the probe cannot provide would be worse than none."""
+
+    async def claude_boom(sdk: Any, model: str) -> Any:
+        raise RuntimeError("stubbed")
+
+    def codex_boom(config: Any, **kwargs: Any) -> str:
+        raise RuntimeError("stubbed")
+
+    monkeypatch.setattr(check_mod, "_run_claude_probe", claude_boom)
+    monkeypatch.setattr(
+        "rpent.planner.codex.build_probe_config", lambda base_url=None: object()
+    )
+    monkeypatch.setattr("rpent.planner.codex.run_probe_turn", codex_boom)
+
+    result = check_llm(LlmCheckRequest(planner=planner, deep=True))
+
+    assert result.as_dict()["deep"] == "not applicable to this backend"
 
 
 # ---------------------------------------------------------------------------

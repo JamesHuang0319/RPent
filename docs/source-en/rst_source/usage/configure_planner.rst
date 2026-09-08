@@ -157,7 +157,8 @@ runtime — and reports the outcome:
 It exits ``0`` on success and ``1`` on any failure, and classifies the
 failure as one of ``missing_config``, ``unsupported_provider``,
 ``missing_api_key``, ``auth_failed``, ``invalid_model``,
-``network_error``, ``provider_error``, or ``sdk_error``. Use ``--json``
+``image_rejected``, ``tool_calls_unsupported``, ``network_error``,
+``provider_error``, or ``sdk_error``. Use ``--json``
 for scripting and CI. ``--base-url`` overrides the backend's endpoint,
 and ``--timeout-s`` overrides the diagnostic timeout (30 s for ``api``,
 90 s for the two SDK backends; the ``1200`` s run default is never
@@ -175,9 +176,26 @@ button runs it against the planner and model currently selected in the
 form, so what you test is exactly what **Start Session** will use. Both
 front ends call one implementation in ``rpent.planner.check``.
 
-A passing check proves authentication and reachability only. It does not
-prove the model will accept image blocks (see ``--no-images``), your tool
-schemas, or your context length.
+Pass ``--deep`` to also verify what a run actually sends: the request then
+carries a 1x1 image and offers one tool, so an endpoint that refuses image
+input reports ``image_rejected`` and a model that never calls the tool
+reports ``tool_calls_unsupported``. Only the ``api`` planner varies here —
+``claude_code`` and ``codex`` own their own request shape, so they run the
+same probe either way and say ``"deep": "not applicable to this backend"``
+in the result rather than implying coverage.
+
+A passing check still does not prove your context length will hold, or that
+your full tool schemas serialize.
+
+Pre-flight on every run
+~~~~~~~~~~~~~~~~~~~~~~~
+
+``rpent`` runs the same check itself, in deep mode, before it starts the
+env, VLA, or perception servers. Those take minutes and hold GPUs, and all
+of them boot before the first model call would have surfaced a bad key, so
+the check pays for itself the first time a key is wrong. A failure prints
+the report and exits without starting anything. Pass ``--skip-llm-check``
+to run anyway.
 
 .. _planner-custom:
 
