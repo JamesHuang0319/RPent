@@ -35,7 +35,40 @@ LIBERO-PRO 仿真资源。下面以 LIBERO-PRO 和 ``claude_code`` planner
 
    export SAM3_CHECKPOINT_PATH=$PWD/checkpoints/sam3/sam3.pt
 
-2. 跑一个 LIBERO 任务
+2. 验证 LLM 后端是否可用
+------------------------
+
+一次完整运行会先启动 env_server、vla_server 和 sam3_server 并同步 memory
+语料，之后才会真正调用模型；因此一个写错的 API key 往往要等数分钟启动之后
+才暴露。``rpent-check-llm`` 会向所选后端发出它支持的最小真实请求——不带
+工具、不带图像、不启动任何机器人运行时——并报告结果：
+
+.. code-block:: bash
+
+   rpent-check-llm --planner claude_code --model claude-opus-4-8
+
+成功时打印模型回复与耗时，退出码为 ``0``；失败时打印失败原因与一条修复
+建议，退出码为 ``1``。例如密钥未设置时：
+
+.. code-block:: text
+
+   planner       api
+   model         anthropic:claude-opus-4-8
+   credential    ANTHROPIC_API_KEY (not set)
+   FAILED        missing_api_key
+   detail        ANTHROPIC_API_KEY is not set for provider 'anthropic'.
+   hint          Set ANTHROPIC_API_KEY in this shell, then retry.
+
+.. note::
+
+   ``rpent`` 每次运行也会在启动任何机器人服务之前自动执行同一项检查，失败
+   即退出，因此不会白白花掉服务启动时间。代价是每次运行会多一次很小的计费
+   请求（十余 token）。用 ``--skip-llm-check`` 可以跳过。
+
+完整的失败状态列表、``--deep`` 模式与超时配置，见
+:ref:`验证你的配置 <planner-check>`。
+
+3. 跑一个 LIBERO 任务
 ---------------------
 
 使用 ``claude_code`` planner 跑单个 LIBERO PRO 任务
@@ -49,7 +82,7 @@ LIBERO-PRO 仿真资源。下面以 LIBERO-PRO 和 ``claude_code`` planner
 若要切换到其他 planner（如 ``codex`` 或 ``api``），请参阅
 :doc:`Agentic Planner <usage/configure_planner>`。
 
-3. 通过 Dashboard 查看运行过程
+4. 通过 Dashboard 查看运行过程
 ------------------------------
 
 添加 ``--dashboard`` 后，RPent 会启动本地 Dashboard，并在终端输出访问地址：
@@ -128,6 +161,10 @@ LIBERO-PRO 仿真资源。下面以 LIBERO-PRO 和 ``claude_code`` planner
    * - ``--no-images``
      - 关
      - 纯文本模式：不向模型发送图片字节（用于不支持图片输入的模型）
+   * - ``--skip-llm-check``
+     - 关
+     - 跳过启动前的 LLM 后端预检。预检在任何机器人服务启动之前执行，
+       配置有误时可在数秒内失败，而不必等到 env/VLA/感知服务全部启动
 
 **环境**
 
@@ -173,6 +210,40 @@ LIBERO-PRO 仿真资源。下面以 LIBERO-PRO 和 ``claude_code`` planner
    * - ``--dashboard-language``
      - ``en``
      - Dashboard 界面语言：``en`` | ``zh-cn``
+
+**验证命令 rpent-check-llm**
+
+独立的连通性检查命令，参数与 ``rpent`` 的对应选项同名同义。
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 15 63
+
+   * - 参数
+     - 默认值
+     - 说明
+   * - ``--planner``
+     - ``api``
+     - 要检查的后端：``api`` | ``claude_code`` | ``codex``
+   * - ``--model``
+     - —
+     - 模型 ID；``api`` 需带 provider 前缀。``claude_code`` 与 ``codex``
+       留空则使用后端默认模型
+   * - ``--base-url``
+     - 后端自身的环境变量
+     - 覆盖后端端点
+   * - ``--timeout-s``
+     - ``api`` 30 秒；两个 SDK 后端 90 秒
+     - 本次检查的墙钟上限。运行时的 ``1200`` 秒默认值不会被复用
+   * - ``--deep``
+     - 关
+     - 额外验证真实运行必然会发送的两样东西：请求携带一张 1x1 图像并提供
+       一个工具，于是拒绝图像输入的端点会报 ``image_rejected``、不调用
+       工具的模型会报 ``tool_calls_unsupported``。仅对 ``api`` planner
+       生效
+   * - ``--json``
+     - 关
+     - 输出结构化 JSON，便于脚本与 CI 使用
 
 运行结果
 --------
