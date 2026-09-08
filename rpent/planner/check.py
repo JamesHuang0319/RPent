@@ -490,7 +490,7 @@ def _check_claude_code(request: LlmCheckRequest) -> LlmCheckResult:
     timeout_s = request.resolved_timeout_s()
     started = time.monotonic()
     try:
-        reply = asyncio.run(
+        outcome = asyncio.run(
             asyncio.wait_for(
                 _run_claude_probe(claude_agent_sdk, model),
                 timeout=timeout_s,
@@ -510,17 +510,44 @@ def _check_claude_code(request: LlmCheckRequest) -> LlmCheckResult:
         )
 
     latency_s = round(time.monotonic() - started, 3)
-    if not reply.strip():
+    if (status := _classify_claude_outcome(outcome)) is not None:
         return _result(
-            STATUS_PROVIDER_ERROR,
-            detail="the Claude Agent SDK returned no assistant text.",
+            status,
+            detail=_describe_claude_failure(outcome),
             latency_s=latency_s,
         )
-    return _result(STATUS_OK, reply=reply.strip(), latency_s=latency_s)
+    return _result(STATUS_OK, reply=outcome.reply.strip(), latency_s=latency_s)
 
 
-async def _run_claude_probe(sdk: Any, model: str) -> str:
-    """Consume one tool-free Claude Agent SDK turn and return its text."""
+def _describe_claude_failure(outcome: _ClaudeProbeOutcome) -> str:
+    """Render a Claude probe failure, preferring the SDK's own error fields."""
+    parts: list[str] = []
+    if outcome.sdk_error:
+        parts.append(f"the Claude Agent SDK reported {outcome.sdk_error}")
+    if outcome.api_error_status is not None:
+        parts.append(f"HTTP {outcome.api_error_status}")
+    if not parts:
+        return "the Claude Agent SDK returned no assistant text."
+    return redact_secrets("; ".join(parts) + ".")
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaudeProbeOutcome:
+    """What one Claude Agent SDK probe turn reported.
+
+    Attributes:
+        reply: Concatenated assistant text. Empty when the model said nothing.
+        sdk_error: ``AssistantMessage.error``, e.g. ``authentication_failed``.
+        api_error_status: ``ResultMessage.api_error_status``, e.g. 401.
+    """
+
+    reply: str = ""
+    sdk_error: str | None = None
+    api_error_status: int | None = None
+
+
+async def _run_claude_probe(sdk: Any, model: str) -> _ClaudeProbeOutcome:
+    """Consume one tool-free Claude Agent SDK turn and report what it said."""
     options = sdk.ClaudeAgentOptions(
         model=model,
         max_turns=1,
@@ -529,24 +556,78 @@ async def _run_claude_probe(sdk: Any, model: str) -> str:
         mcp_servers={},
     )
     chunks: list[str] = []
+    sdk_error: str | None = None
+    api_error_status: int | None = None
     async for message in sdk.query(prompt=PROBE_PROMPT, options=options):
         chunks.extend(_assistant_text(message))
-    return "".join(chunks)
+        if isinstance(message, sdk.AssistantMessage):
+            sdk_error = sdk_error or getattr(message, "error", None)
+        elif isinstance(message, sdk.ResultMessage):
+            api_error_status = getattr(message, "api_error_status", None)
+    return _ClaudeProbeOutcome(
+        reply="".join(chunks),
+        sdk_error=sdk_error,
+        api_error_status=api_error_status,
+    )
 
 
 def _assistant_text(message: Any) -> list[str]:
-    """Extract plain assistant text from one Claude Agent SDK message."""
+    """Extract assistant text from one Claude Agent SDK message.
+
+    Only ``AssistantMessage`` carries the model's reply. The stream also
+    contains a ``UserMessage`` echoing the prompt we sent, so reading
+    ``content`` off every message would mistake our own probe prompt for an
+    answer and report a dead backend as healthy. ``ThinkingBlock`` keeps its
+    text under ``thinking`` and is correctly skipped by the ``TextBlock``
+    check.
+
+    Args:
+        message: One message from the SDK's stream.
+
+    Returns:
+        The message's assistant text blocks; empty for every other kind.
+    """
+    import claude_agent_sdk as sdk
+
+    if not isinstance(message, sdk.AssistantMessage):
+        return []
     content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return [content]
     if not isinstance(content, list):
         return []
-    out: list[str] = []
-    for block in content:
-        text = getattr(block, "text", None)
-        if isinstance(text, str) and text:
-            out.append(text)
-    return out
+    return [
+        block.text
+        for block in content
+        if isinstance(block, sdk.TextBlock) and block.text
+    ]
+
+
+def _classify_claude_outcome(outcome: _ClaudeProbeOutcome) -> str | None:
+    """Map a probe outcome onto a failure status, or ``None`` when it passed.
+
+    The SDK reports typed failures of its own, so they are classified from
+    that structure rather than from message-text matching.
+
+    Args:
+        outcome: What the probe turn reported.
+
+    Returns:
+        A status constant, or ``None`` if the probe succeeded.
+    """
+    if outcome.sdk_error:
+        return (
+            STATUS_AUTH_FAILED
+            if outcome.sdk_error == "authentication_failed"
+            else STATUS_PROVIDER_ERROR
+        )
+    if outcome.api_error_status is not None:
+        return (
+            STATUS_AUTH_FAILED
+            if outcome.api_error_status in (401, 403)
+            else STATUS_PROVIDER_ERROR
+        )
+    if not outcome.reply.strip():
+        return STATUS_PROVIDER_ERROR
+    return None
 
 
 # ---------------------------------------------------------------------------

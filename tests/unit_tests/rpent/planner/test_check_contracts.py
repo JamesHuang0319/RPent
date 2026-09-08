@@ -437,17 +437,23 @@ def test_sdk_backends_report_sdk_error_when_the_package_is_absent(
 def test_claude_code_defaults_to_sonnet_and_reports_its_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Patched at the SDK boundary, so the probe's own parsing stays under test.
+    import claude_agent_sdk
+    from claude_agent_sdk import TextBlock
+
     seen: dict[str, Any] = {}
 
-    async def fake_probe(sdk: Any, model: str) -> str:
-        seen["model"] = model
-        return "ok"
+    async def fake_query(*, prompt: str, options: Any):
+        seen["model"] = options.model
+        yield _assistant([TextBlock(text="ok")])
+        yield _result_message(result="ok")
 
-    monkeypatch.setattr(check_mod, "_run_claude_probe", fake_probe)
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
     result = check_llm(LlmCheckRequest(planner="claude_code"))
 
     assert seen["model"] == "sonnet"
     assert result.ok is True
+    assert result.reply == "ok"
     assert result.credential_env == "ANTHROPIC_API_KEY"
     assert result.credential_present is False
 
@@ -544,3 +550,191 @@ def test_sdk_backend_timeout_reports_network_error(
     result = check_llm(LlmCheckRequest(planner="claude_code", timeout_s=1))
 
     assert result.status == STATUS_NETWORK_ERROR
+
+
+# ---------------------------------------------------------------------------
+# claude_code probe: SDK message-parsing contract
+#
+# The probe's success criterion is "a non-empty assistant reply", so it must
+# parse the SDK's message stream. These tests pin that parsing against the
+# real SDK types instead of a hand-shaped double, the way
+# test_codex_contracts.py pins TurnHandle.
+# ---------------------------------------------------------------------------
+
+
+def test_claude_sdk_message_types_carry_the_fields_the_probe_reads() -> None:
+    """Pin the SDK surface the probe depends on.
+
+    ``UserMessage.content`` is asserted deliberately: the stream echoes the
+    prompt back, so a parser that reads ``content`` off every message would
+    mistake our own prompt for the model's reply.
+    """
+    import claude_agent_sdk as sdk
+
+    assert "content" in sdk.AssistantMessage.__annotations__
+    assert "text" in sdk.TextBlock.__annotations__
+    # The structured error channels the probe must classify from.
+    assert "error" in sdk.AssistantMessage.__annotations__
+    assert "api_error_status" in sdk.ResultMessage.__annotations__
+    assert "is_error" in sdk.ResultMessage.__annotations__
+    # The trap: a user message carries content too.
+    assert "content" in sdk.UserMessage.__annotations__
+    # Thinking text lives under a different field and must not be collected.
+    assert "text" not in sdk.ThinkingBlock.__annotations__
+    assert "thinking" in sdk.ThinkingBlock.__annotations__
+
+
+def _assistant(content: Any, **kwargs: Any) -> Any:
+    from claude_agent_sdk import AssistantMessage
+
+    return AssistantMessage(content=content, model="claude-test", **kwargs)
+
+
+def _result_message(**kwargs: Any) -> Any:
+    from claude_agent_sdk import ResultMessage
+
+    defaults: dict[str, Any] = {
+        "subtype": "success",
+        "duration_ms": 10,
+        "duration_api_ms": 10,
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "s1",
+    }
+    return ResultMessage(**{**defaults, **kwargs})
+
+
+def test_probe_ignores_the_echoed_user_prompt() -> None:
+    """The stream echoes our prompt; it is not the model's reply."""
+    from claude_agent_sdk import UserMessage
+
+    assert check_mod._assistant_text(UserMessage(content=PROBE_PROMPT)) == []
+
+
+def test_probe_collects_only_assistant_text_blocks() -> None:
+    from claude_agent_sdk import TextBlock, ThinkingBlock
+
+    message = _assistant(
+        [ThinkingBlock(thinking="pondering", signature="sig"), TextBlock(text="ok")]
+    )
+
+    assert check_mod._assistant_text(message) == ["ok"]
+
+
+def test_probe_ignores_system_and_result_messages() -> None:
+    from claude_agent_sdk import SystemMessage
+
+    assert check_mod._assistant_text(SystemMessage(subtype="init", data={})) == []
+    assert check_mod._assistant_text(_result_message(result="ok")) == []
+
+
+def _patch_claude_query(monkeypatch: pytest.MonkeyPatch, messages: list[Any]) -> None:
+    """Replace sdk.query at the SDK boundary, keeping our parsing under test."""
+    import claude_agent_sdk
+
+    async def fake_query(*, prompt: str, options: Any):
+        for message in messages:
+            yield message
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+
+
+def test_claude_code_success_reads_the_assistant_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_agent_sdk import TextBlock, UserMessage
+
+    _patch_claude_query(
+        monkeypatch,
+        [
+            UserMessage(content=PROBE_PROMPT),
+            _assistant([TextBlock(text="ok")]),
+            _result_message(result="ok"),
+        ],
+    )
+
+    result = check_llm(LlmCheckRequest(planner="claude_code"))
+
+    assert result.ok is True
+    assert result.reply == "ok"
+
+
+def test_claude_code_echo_only_stream_is_not_a_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model said nothing; only our own prompt came back."""
+    from claude_agent_sdk import UserMessage
+
+    _patch_claude_query(
+        monkeypatch,
+        [
+            UserMessage(content=PROBE_PROMPT),
+            _assistant([]),
+            _result_message(is_error=True, subtype="error"),
+        ],
+    )
+
+    result = check_llm(LlmCheckRequest(planner="claude_code"))
+
+    assert result.ok is False, "an echoed prompt must not count as a reply"
+
+
+@pytest.mark.parametrize(
+    ("sdk_error", "expected"),
+    [
+        ("authentication_failed", STATUS_AUTH_FAILED),
+        ("billing_error", STATUS_PROVIDER_ERROR),
+        ("rate_limit", STATUS_PROVIDER_ERROR),
+        ("invalid_request", STATUS_PROVIDER_ERROR),
+        ("server_error", STATUS_PROVIDER_ERROR),
+    ],
+)
+def test_claude_code_structured_error_is_classified(
+    monkeypatch: pytest.MonkeyPatch, sdk_error: str, expected: str
+) -> None:
+    """The SDK reports typed errors; the probe must not flatten them."""
+    _patch_claude_query(
+        monkeypatch,
+        [
+            _assistant([], error=sdk_error),
+            _result_message(is_error=True, subtype="error"),
+        ],
+    )
+
+    result = check_llm(LlmCheckRequest(planner="claude_code"))
+
+    assert result.ok is False
+    assert result.status == expected
+    assert sdk_error in result.detail
+
+
+def test_claude_code_api_error_status_401_is_auth_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_claude_query(
+        monkeypatch,
+        [
+            _assistant([]),
+            _result_message(is_error=True, subtype="error", api_error_status=401),
+        ],
+    )
+
+    result = check_llm(LlmCheckRequest(planner="claude_code"))
+
+    assert result.status == STATUS_AUTH_FAILED
+
+
+def test_claude_code_api_error_status_429_is_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_claude_query(
+        monkeypatch,
+        [
+            _assistant([]),
+            _result_message(is_error=True, subtype="error", api_error_status=429),
+        ],
+    )
+
+    result = check_llm(LlmCheckRequest(planner="claude_code"))
+
+    assert result.status == STATUS_PROVIDER_ERROR
