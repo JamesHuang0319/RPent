@@ -145,7 +145,8 @@ RPent 通过 SDK 创建进程内 MCP 服务，并把 toolkit 的工具注册到
 ``missing_config``、``unsupported_provider``、``missing_api_key``、
 ``auth_failed``、``invalid_model``、``image_rejected``、
 ``tool_calls_unsupported``、``network_error``、``provider_error``、
-``sdk_error`` 之一。脚本与 CI 建议使用 ``--json``。
+``sdk_error`` 之一。后端拒绝模型时，识别依据是报错里回显的模型 id，而不是
+报错措辞——网关会改措辞。脚本与 CI 建议使用 ``--json``。
 ``--base-url`` 覆盖后端端点，``--timeout-s`` 覆盖诊断超时（``api`` 为
 30 秒，两个 SDK 后端为 90 秒；运行时的 ``1200`` 秒默认值不会被复用）。
 

@@ -158,7 +158,9 @@ It exits ``0`` on success and ``1`` on any failure, and classifies the
 failure as one of ``missing_config``, ``unsupported_provider``,
 ``missing_api_key``, ``auth_failed``, ``invalid_model``,
 ``image_rejected``, ``tool_calls_unsupported``, ``network_error``,
-``provider_error``, or ``sdk_error``. Use ``--json``
+``provider_error``, or ``sdk_error``. A model the backend refuses is
+recognised by the model id the error echoes back rather than by its
+wording, which gateways change. Use ``--json``
 for scripting and CI. ``--base-url`` overrides the backend's endpoint,
 and ``--timeout-s`` overrides the diagnostic timeout (30 s for ``api``,
 90 s for the two SDK backends; the ``1200`` s run default is never

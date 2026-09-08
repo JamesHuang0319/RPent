@@ -798,7 +798,7 @@ def _check_claude_code(request: LlmCheckRequest) -> LlmCheckResult:
         )
     except Exception as exc:  # noqa: BLE001 - classified below
         return _result(
-            _classify_sdk_error(exc, key_present=key_present),
+            _classify_sdk_error(exc, key_present=key_present, model=model),
             detail=_describe(exc),
             latency_s=round(time.monotonic() - started, 3),
         )
@@ -980,7 +980,7 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
         )
     except Exception as exc:  # noqa: BLE001 - classified below
         return _result(
-            _classify_sdk_error(exc, key_present=key_present),
+            _classify_sdk_error(exc, key_present=key_present, model=model),
             detail=_describe(exc),
             latency_s=round(time.monotonic() - started, 3),
         )
@@ -995,7 +995,37 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
     return _result(STATUS_OK, reply=reply.strip(), latency_s=latency_s)
 
 
-def _classify_sdk_error(exc: Exception, *, key_present: bool) -> str:
+def _names_the_requested_model(text: str, model: str | None) -> bool:
+    """Whether a 4xx message echoes back the model id that was requested.
+
+    Gateways reword their model rejections freely: the same endpoint
+    answered one probe with ``is not available for this group`` and the
+    next, hours later, with ``is not supported by any configured account
+    in this group``. Chasing that wording is a losing game. What every one
+    of them does do is name the model it refused, so the model id plus a
+    4xx status is the stable signal.
+
+    Args:
+        text: The lower-cased error message.
+        model: The model id that was requested, when one was.
+
+    Returns:
+        True when a 4xx message contains the requested model id.
+    """
+    if not model or len(model) < 3:
+        # Too short to be distinctive; a bare "o3" would match by accident.
+        return False
+    if model.lower() not in text:
+        return False
+    return bool(re.search(r"\b4\d\d\b", text))
+
+
+def _classify_sdk_error(
+    exc: Exception,
+    *,
+    key_present: bool,
+    model: str | None = None,
+) -> str:
     """Classify a child-process SDK failure from its message.
 
     The Claude and Codex SDKs surface provider problems as SDK exceptions
@@ -1004,6 +1034,8 @@ def _classify_sdk_error(exc: Exception, *, key_present: bool) -> str:
     Args:
         exc: The exception raised by the SDK.
         key_present: Whether the backend's credential env var was set.
+        model: The model id that was requested, used to recognise a model
+            rejection without depending on the gateway's wording.
 
     Returns:
         The matching status constant.
@@ -1021,11 +1053,13 @@ def _classify_sdk_error(exc: Exception, *, key_present: bool) -> str:
         for token in ("not logged in", "no credentials", "login", "api key")
     ):
         return STATUS_MISSING_API_KEY if not key_present else STATUS_AUTH_FAILED
+    if _names_the_requested_model(text, model):
+        return STATUS_INVALID_MODEL
     if any(
         token in text
         for token in (
-            # Gateways word this rejection differently; every phrase below was
-            # observed from a real backend, not guessed.
+            # Fallback for gateways that refuse without echoing the id. Every
+            # phrase below was observed from a real backend, not guessed.
             "model does not exist",
             "unknown model",
             "invalid model",

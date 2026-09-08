@@ -823,6 +823,65 @@ def test_codex_without_any_credential_reports_missing_api_key(
     assert "CODEX_API_KEY" in result.detail
 
 
+MODEL_ID = "definitely-not-a-real-model"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        # Both verbatim from the same gateway, hours apart. The wording moved;
+        # the echoed model id did not.
+        (
+            f'unexpected status 404 Not Found: Model "{MODEL_ID}" is not '
+            "available for this group, url: https://gateway.example/responses",
+            STATUS_INVALID_MODEL,
+        ),
+        (
+            f'unexpected status 404 Not Found: Model "{MODEL_ID}" is not '
+            "supported by any configured account in this group, "
+            "url: https://gateway.example/responses",
+            STATUS_INVALID_MODEL,
+        ),
+        # Wording this rule has never seen, to prove it does not depend on it.
+        (
+            f"HTTP 422: the model {MODEL_ID} cannot be served right now",
+            STATUS_INVALID_MODEL,
+        ),
+        # A 4xx that names no model is a bad endpoint, not a bad model.
+        (
+            "unexpected status 404 Not Found: no route for /v1/chat",
+            STATUS_SDK_ERROR,
+        ),
+        # The model id in a 5xx is incidental; the server is the problem.
+        (
+            f"500 Internal Server Error while serving {MODEL_ID}",
+            STATUS_PROVIDER_ERROR,
+        ),
+    ],
+)
+def test_a_4xx_naming_the_requested_model_is_a_model_rejection(
+    message: str, expected: str
+) -> None:
+    """Gateways reword model rejections; they still name the model.
+
+    Keying on the wording alone already failed twice against one real
+    gateway, so the echoed model id carries this rule instead.
+    """
+    status = check_mod._classify_sdk_error(
+        RuntimeError(message), key_present=True, model=MODEL_ID
+    )
+
+    assert status == expected
+
+
+def test_a_model_id_too_short_to_be_distinctive_is_not_matched() -> None:
+    status = check_mod._classify_sdk_error(
+        RuntimeError("404 not found: o3 lookup failed"), key_present=True, model="o3"
+    )
+
+    assert status == STATUS_SDK_ERROR
+
+
 @pytest.mark.parametrize(
     ("message", "key_present", "expected"),
     [
