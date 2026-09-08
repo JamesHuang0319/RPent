@@ -85,8 +85,10 @@ DEFAULT_TIMEOUT_S = {"api": 30, "claude_code": 90, "codex": 90}
 #: Budget for the SDK backends when neither a credential env var nor a CLI
 #: login file was found. Short enough to fail fast instead of spending the
 #: full default, long enough that a credential this module cannot see (an OS
-#: keychain entry, say) still has room to answer.
-NO_CREDENTIAL_TIMEOUT_S = 10
+#: keychain entry, say) still has room to answer. A cold Codex probe against a
+#: gateway was measured at 15.3s, so anything near 10s turns a slow success
+#: into a false "missing key".
+NO_CREDENTIAL_TIMEOUT_S = 25
 
 #: Best-effort CLI login markers for the two child-process SDK backends. Both
 #: accept an interactive login instead of an env var, so absence is only a
@@ -884,14 +886,21 @@ def _classify_sdk_error(exc: Exception, *, key_present: bool) -> str:
     if any(
         token in text
         for token in (
+            # Gateways word this rejection differently; every phrase below was
+            # observed from a real backend, not guessed.
             "model does not exist",
             "unknown model",
             "invalid model",
             "model not found",
+            "is not available",
+            "unrecognized_model",
+            "unrecognized model",
         )
     ) or re.search(r"\b400\b", text):
-        # Matched on wording first and the bare status second: "400" appears in
-        # timestamps, token counts, and model names, so it is the weaker signal.
+        # Wording first, bare status second: "400" also appears in timestamps
+        # and token counts. A bare 404 is deliberately NOT matched -- a wrong
+        # base_url returns 404 too, and calling that an invalid model would
+        # send people to change the one setting that was already correct.
         return STATUS_INVALID_MODEL
     if any(
         token in text

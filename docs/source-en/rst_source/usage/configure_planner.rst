@@ -166,7 +166,7 @@ reused).
 ``claude_code`` and ``codex`` accept an interactive CLI login instead of
 an environment variable, so a missing variable alone is not treated as
 fatal. When neither the variable nor a CLI login file is found, the probe
-still runs but on a 10 s budget, and a timeout is reported as
+still runs but on a 25 s budget, and a timeout is reported as
 ``missing_api_key`` rather than ``network_error``. An explicit
 ``--timeout-s`` is always honoured as given.
 

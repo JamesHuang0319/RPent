@@ -150,7 +150,7 @@ RPent 通过 SDK 创建进程内 MCP 服务，并把 toolkit 的工具注册到
 
 ``claude_code`` 与 ``codex`` 允许用 CLI 交互式登录替代环境变量，因此仅凭
 环境变量缺失并不视为致命错误。当环境变量与 CLI 登录文件都找不到时，探测
-仍会执行，但预算缩短为 10 秒，且超时会归类为 ``missing_api_key`` 而非
+仍会执行，但预算缩短为 25 秒，且超时会归类为 ``missing_api_key`` 而非
 ``network_error``。显式传入的 ``--timeout-s`` 始终按给定值生效。
 
 Dashboard 提供同一项检查：启动页的 **测试连接** 按钮会针对表单中当前

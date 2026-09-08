@@ -622,6 +622,17 @@ def test_no_credential_shortens_the_probe_budget(planner: str) -> None:
     assert NO_CREDENTIAL_TIMEOUT_S < DEFAULT_TIMEOUT_S[planner]
 
 
+def test_the_no_credential_budget_clears_a_measured_cold_probe() -> None:
+    """A slow success must not be mistaken for a missing credential.
+
+    A cold Codex probe against a real gateway replied in 15.3s. A budget at
+    or below that turns every such run into a false ``missing_api_key``
+    whenever login detection misses, which it can: it reads known files and
+    the macOS Keychain, and a backend may store its credential elsewhere.
+    """
+    assert NO_CREDENTIAL_TIMEOUT_S > 15.3
+
+
 @pytest.mark.parametrize("planner", ["claude_code", "codex"])
 def test_a_credential_keeps_the_full_probe_budget(planner: str) -> None:
     request = LlmCheckRequest(planner=planner)
@@ -694,8 +705,29 @@ def test_codex_without_any_credential_reports_missing_api_key(
         ("400 model does not exist", True, STATUS_INVALID_MODEL),
         ("unknown model 'gpt-9'", True, STATUS_INVALID_MODEL),
         ("HTTP 400 Bad Request", True, STATUS_INVALID_MODEL),
+        # Verbatim from a Codex probe against a real gateway: the status is
+        # 404, not 400, and the wording matches none of the phrases above.
+        (
+            'unexpected status 404 Not Found: Model "definitely-not-a-real-model" '
+            "is not available for this group, url: https://gateway.example/responses, "
+            "cf-ray: a37dbb0389e965c9-FRA",
+            True,
+            STATUS_INVALID_MODEL,
+        ),
+        # Verbatim from the Claude Code SDK.
+        (
+            '[claude-code:unrecognized_model] {"model":"nope"}',
+            True,
+            STATUS_INVALID_MODEL,
+        ),
         # "400" inside a larger number must not trip the bare-status fallback.
         ("served 2400 tokens then crashed", False, STATUS_SDK_ERROR),
+        # A bare 404 with no model wording is a bad endpoint, not a bad model.
+        (
+            "unexpected status 404 Not Found: no route for /v1/chat",
+            False,
+            STATUS_SDK_ERROR,
+        ),
         ("something entirely unexpected", False, STATUS_SDK_ERROR),
     ],
 )
