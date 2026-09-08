@@ -156,11 +156,19 @@ runtime — and reports the outcome:
 
 It exits ``0`` on success and ``1`` on any failure, and classifies the
 failure as one of ``missing_config``, ``unsupported_provider``,
-``missing_api_key``, ``auth_failed``, ``network_error``,
-``provider_error``, or ``sdk_error``. Use ``--json`` for scripting and
-CI. ``--base-url`` overrides the backend's endpoint, and ``--timeout-s``
-overrides the diagnostic timeout (30 s for ``api``, 90 s for the two SDK
-backends; the ``1200`` s run default is never reused).
+``missing_api_key``, ``auth_failed``, ``invalid_model``,
+``network_error``, ``provider_error``, or ``sdk_error``. Use ``--json``
+for scripting and CI. ``--base-url`` overrides the backend's endpoint,
+and ``--timeout-s`` overrides the diagnostic timeout (30 s for ``api``,
+90 s for the two SDK backends; the ``1200`` s run default is never
+reused).
+
+``claude_code`` and ``codex`` accept an interactive CLI login instead of
+an environment variable, so a missing variable alone is not treated as
+fatal. When neither the variable nor a CLI login file is found, the probe
+still runs but on a 10 s budget, and a timeout is reported as
+``missing_api_key`` rather than ``network_error``. An explicit
+``--timeout-s`` is always honoured as given.
 
 The Dashboard exposes the same check: the launcher's **Test connection**
 button runs it against the planner and model currently selected in the

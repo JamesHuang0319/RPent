@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -27,8 +28,10 @@ from rpent.planner import check as check_mod
 from rpent.planner.check import (
     CHECK_STATUSES,
     DEFAULT_TIMEOUT_S,
+    NO_CREDENTIAL_TIMEOUT_S,
     PROBE_PROMPT,
     STATUS_AUTH_FAILED,
+    STATUS_INVALID_MODEL,
     STATUS_MISSING_API_KEY,
     STATUS_MISSING_CONFIG,
     STATUS_NETWORK_ERROR,
@@ -56,6 +59,16 @@ def _clear_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "CODEX_MODEL",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_cli_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's real CLI login out of the no-credential path.
+
+    ``_has_cli_login`` reads files under ``~``, so without this the SDK
+    tests would pass or fail depending on whose machine they run on.
+    """
+    monkeypatch.setattr(check_mod, "_has_cli_login", lambda planner: False)
 
 
 def _reply_model(text: str = "ok") -> FunctionModel:
@@ -96,6 +109,7 @@ def test_every_status_is_declared_in_the_public_tuple() -> None:
         STATUS_UNSUPPORTED_PROVIDER,
         STATUS_MISSING_API_KEY,
         STATUS_AUTH_FAILED,
+        STATUS_INVALID_MODEL,
         STATUS_NETWORK_ERROR,
         STATUS_PROVIDER_ERROR,
         STATUS_SDK_ERROR,
@@ -229,6 +243,7 @@ def test_api_empty_reply_is_a_provider_error_not_a_success(
 @pytest.mark.parametrize(
     ("status_code", "expected"),
     [
+        (400, STATUS_INVALID_MODEL),
         (401, STATUS_AUTH_FAILED),
         (403, STATUS_AUTH_FAILED),
         (404, STATUS_PROVIDER_ERROR),
@@ -475,13 +490,15 @@ def test_codex_probe_runs_without_an_mcp_server(
         seen["timeout_s"] = timeout_s
         return "ok"
 
+    # A credential is present, so the probe gets the full default budget.
+    monkeypatch.setenv("CODEX_API_KEY", SENTINEL_KEY)
     monkeypatch.setattr("rpent.planner.codex.build_probe_config", fake_config)
     monkeypatch.setattr("rpent.planner.codex.run_probe_turn", fake_probe)
     result = check_llm(LlmCheckRequest(planner="codex", model="gpt-5.5"))
 
     assert result.ok is True
     assert seen["model"] == "gpt-5.5"
-    assert seen["timeout_s"] == 90
+    assert seen["timeout_s"] == DEFAULT_TIMEOUT_S["codex"]
     assert seen["prompt"] == PROBE_PROMPT
     assert result.credential_env == "CODEX_API_KEY"
 
@@ -508,6 +525,7 @@ def test_codex_probe_timeout_reports_network_error(
     def timing_out_probe(config: Any, **kwargs: Any) -> str:
         raise TimeoutError("the Codex SDK did not finish within 90s.")
 
+    monkeypatch.setenv("CODEX_API_KEY", SENTINEL_KEY)
     monkeypatch.setattr(
         "rpent.planner.codex.build_probe_config", lambda base_url=None: object()
     )
@@ -515,6 +533,153 @@ def test_codex_probe_timeout_reports_network_error(
     result = check_llm(LlmCheckRequest(planner="codex"))
 
     assert result.status == STATUS_NETWORK_ERROR
+
+
+# ---------------------------------------------------------------------------
+# SDK backends: the no-credential budget
+#
+# Both accept an interactive CLI login instead of an env var, so a missing
+# variable can never skip the probe outright. It only shortens the budget and
+# renames the timeout, so a user with no key waits seconds, not a minute and
+# a half, and is told which of the two it was.
+# ---------------------------------------------------------------------------
+
+
+def test_a_login_file_is_detected_as_a_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.undo()  # drop the autouse _has_cli_login stub
+    login = tmp_path / "auth.json"
+    login.write_text("{}")
+    monkeypatch.setattr(check_mod, "_CLI_LOGIN_FILES", {"codex": (str(login),)})
+    monkeypatch.setattr(check_mod, "_KEYCHAIN_SERVICES", {})
+
+    assert check_mod._has_cli_login("codex") is True
+    assert check_mod._has_cli_login("claude_code") is False
+
+
+def test_the_macos_keychain_counts_as_a_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """macOS stores the Claude credential outside the filesystem.
+
+    Without this lookup a logged-in Mac user with no env var would be put on
+    the no-credential path and a slow reply misreported as a missing key.
+    """
+    monkeypatch.undo()  # drop the autouse _has_cli_login stub
+    monkeypatch.setattr(check_mod, "_CLI_LOGIN_FILES", {})
+    monkeypatch.setattr(check_mod.sys, "platform", "darwin")
+    seen: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        seen["cmd"] = cmd
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(check_mod.subprocess, "run", fake_run)
+
+    assert check_mod._has_cli_login("claude_code") is True
+    # Existence only: -w would read the secret and prompt for the Keychain.
+    assert "-w" not in seen["cmd"]
+
+
+def test_the_keychain_is_not_consulted_off_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()  # drop the autouse _has_cli_login stub
+    monkeypatch.setattr(check_mod, "_CLI_LOGIN_FILES", {})
+    monkeypatch.setattr(check_mod.sys, "platform", "linux")
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the keychain must not be consulted off macOS")
+
+    monkeypatch.setattr(check_mod.subprocess, "run", explode)
+
+    assert check_mod._has_cli_login("claude_code") is False
+
+
+def test_a_broken_keychain_lookup_is_not_a_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()  # drop the autouse _has_cli_login stub
+    monkeypatch.setattr(check_mod, "_CLI_LOGIN_FILES", {})
+    monkeypatch.setattr(check_mod.sys, "platform", "darwin")
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("security binary is missing")
+
+    monkeypatch.setattr(check_mod.subprocess, "run", explode)
+
+    assert check_mod._has_cli_login("claude_code") is False
+
+
+@pytest.mark.parametrize("planner", ["claude_code", "codex"])
+def test_no_credential_shortens_the_probe_budget(planner: str) -> None:
+    request = LlmCheckRequest(planner=planner)
+
+    budget = check_mod._sdk_probe_budget(request, no_credential=True)
+
+    assert budget == NO_CREDENTIAL_TIMEOUT_S
+    assert NO_CREDENTIAL_TIMEOUT_S < DEFAULT_TIMEOUT_S[planner]
+
+
+@pytest.mark.parametrize("planner", ["claude_code", "codex"])
+def test_a_credential_keeps_the_full_probe_budget(planner: str) -> None:
+    request = LlmCheckRequest(planner=planner)
+
+    budget = check_mod._sdk_probe_budget(request, no_credential=False)
+
+    assert budget == DEFAULT_TIMEOUT_S[planner]
+
+
+def test_an_explicit_timeout_survives_the_no_credential_shortcut() -> None:
+    request = LlmCheckRequest(planner="codex", timeout_s=45)
+
+    assert check_mod._sdk_probe_budget(request, no_credential=True) == 45
+
+
+def test_a_cli_login_counts_as_a_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A logged-in user with no env var must not be shortened or misreported."""
+    monkeypatch.setattr(check_mod, "_has_cli_login", lambda planner: True)
+
+    async def never_finishes(sdk: Any, model: str) -> str:
+        await asyncio.sleep(30)
+        return "unreachable"
+
+    monkeypatch.setattr(check_mod, "_run_claude_probe", never_finishes)
+    result = check_llm(LlmCheckRequest(planner="claude_code", timeout_s=1))
+
+    assert result.status == STATUS_NETWORK_ERROR
+
+
+def test_claude_code_without_any_credential_reports_missing_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def never_finishes(sdk: Any, model: str) -> str:
+        await asyncio.sleep(30)
+        return "unreachable"
+
+    monkeypatch.setattr(check_mod, "_run_claude_probe", never_finishes)
+    result = check_llm(LlmCheckRequest(planner="claude_code", timeout_s=1))
+
+    assert result.status == STATUS_MISSING_API_KEY
+    assert "ANTHROPIC_API_KEY" in result.detail
+    assert "CLI login" in result.detail
+
+
+def test_codex_without_any_credential_reports_missing_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timing_out_probe(config: Any, **kwargs: Any) -> str:
+        raise TimeoutError("the Codex SDK did not finish in time.")
+
+    monkeypatch.setattr(
+        "rpent.planner.codex.build_probe_config", lambda base_url=None: object()
+    )
+    monkeypatch.setattr("rpent.planner.codex.run_probe_turn", timing_out_probe)
+    result = check_llm(LlmCheckRequest(planner="codex", timeout_s=1))
+
+    assert result.status == STATUS_MISSING_API_KEY
+    assert "CODEX_API_KEY" in result.detail
 
 
 @pytest.mark.parametrize(
@@ -526,6 +691,11 @@ def test_codex_probe_timeout_reports_network_error(
         ("please run login", True, STATUS_AUTH_FAILED),
         ("failed to resolve host", False, STATUS_NETWORK_ERROR),
         ("429 rate limit exceeded", False, STATUS_PROVIDER_ERROR),
+        ("400 model does not exist", True, STATUS_INVALID_MODEL),
+        ("unknown model 'gpt-9'", True, STATUS_INVALID_MODEL),
+        ("HTTP 400 Bad Request", True, STATUS_INVALID_MODEL),
+        # "400" inside a larger number must not trip the bare-status fallback.
+        ("served 2400 tokens then crashed", False, STATUS_SDK_ERROR),
         ("something entirely unexpected", False, STATUS_SDK_ERROR),
     ],
 )
@@ -542,6 +712,9 @@ def test_sdk_error_messages_are_classified(
 def test_sdk_backend_timeout_reports_network_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # With a credential in hand a timeout really is a transport failure.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+
     async def never_finishes(sdk: Any, model: str) -> str:
         await asyncio.sleep(30)
         return "unreachable"
@@ -722,6 +895,22 @@ def test_claude_code_api_error_status_401_is_auth_failed(
     result = check_llm(LlmCheckRequest(planner="claude_code"))
 
     assert result.status == STATUS_AUTH_FAILED
+
+
+def test_claude_code_api_error_status_400_is_invalid_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_claude_query(
+        monkeypatch,
+        [
+            _assistant([]),
+            _result_message(is_error=True, subtype="error", api_error_status=400),
+        ],
+    )
+
+    result = check_llm(LlmCheckRequest(planner="claude_code"))
+
+    assert result.status == STATUS_INVALID_MODEL
 
 
 def test_claude_code_api_error_status_429_is_provider_error(

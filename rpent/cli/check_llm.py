@@ -24,11 +24,11 @@ from __future__ import annotations
 import argparse
 import json
 
-from rpent.planner.base import REASONING_EFFORTS
 from rpent.planner.check import (
     CHECK_PLANNERS,
     DEFAULT_TIMEOUT_S,
     STATUS_AUTH_FAILED,
+    STATUS_INVALID_MODEL,
     STATUS_MISSING_API_KEY,
     STATUS_MISSING_CONFIG,
     STATUS_NETWORK_ERROR,
@@ -71,13 +71,6 @@ def _parser() -> argparse.ArgumentParser:
         help="API base URL. Defaults to the selected backend's base URL env var.",
     )
     parser.add_argument(
-        "--reasoning-effort",
-        choices=REASONING_EFFORTS,
-        default="none",
-        help="Accepted for symmetry with the run CLI. The probe always uses "
-        "'none' so a thinking budget cannot consume the reply.",
-    )
-    parser.add_argument(
         "--timeout-s",
         type=int,
         default=None,
@@ -114,6 +107,10 @@ def _remediation(result: LlmCheckResult) -> str:
             "Use a provider RPent installs: anthropic:, openai:, or openai-chat:."
         ),
         STATUS_MISSING_API_KEY: f"Set {credential} in this shell, then retry.",
+        STATUS_INVALID_MODEL: (
+            f"The provider rejected the model id. Check that --model exists "
+            f"for this backend and that {credential} has access to it."
+        ),
         STATUS_AUTH_FAILED: (
             f"The provider rejected {credential}. Check the key, and that it "
             f"matches the endpoint in {base_url_env} / --base-url."

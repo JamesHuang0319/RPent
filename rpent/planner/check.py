@@ -28,8 +28,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from rpent.utils.logging import get_logger
@@ -50,6 +54,8 @@ STATUS_UNSUPPORTED_PROVIDER = "unsupported_provider"
 STATUS_MISSING_API_KEY = "missing_api_key"
 #: The provider rejected the credential (HTTP 401 / 403).
 STATUS_AUTH_FAILED = "auth_failed"
+#: The provider was reached and rejected the model id (HTTP 400).
+STATUS_INVALID_MODEL = "invalid_model"
 #: DNS, connection, TLS failure, or a timeout.
 STATUS_NETWORK_ERROR = "network_error"
 #: The provider was reached and refused (404, 429, 5xx, ...).
@@ -64,6 +70,7 @@ CHECK_STATUSES = (
     STATUS_UNSUPPORTED_PROVIDER,
     STATUS_MISSING_API_KEY,
     STATUS_AUTH_FAILED,
+    STATUS_INVALID_MODEL,
     STATUS_NETWORK_ERROR,
     STATUS_PROVIDER_ERROR,
     STATUS_SDK_ERROR,
@@ -74,6 +81,27 @@ CHECK_PLANNERS = ("api", "claude_code", "codex")
 
 #: Diagnostic timeouts, deliberately independent of the 1200s run default.
 DEFAULT_TIMEOUT_S = {"api": 30, "claude_code": 90, "codex": 90}
+
+#: Budget for the SDK backends when neither a credential env var nor a CLI
+#: login file was found. Short enough to fail fast instead of spending the
+#: full default, long enough that a credential this module cannot see (an OS
+#: keychain entry, say) still has room to answer.
+NO_CREDENTIAL_TIMEOUT_S = 10
+
+#: Best-effort CLI login markers for the two child-process SDK backends. Both
+#: accept an interactive login instead of an env var, so absence is only a
+#: hint that no credential exists — never a verdict. It shortens the probe's
+#: budget; it never skips the probe.
+_CLI_LOGIN_FILES = {
+    "claude_code": ("~/.claude/.credentials.json",),
+    "codex": ("~/.codex/auth.json",),
+}
+
+#: macOS keeps the Claude Code credential in the login Keychain instead of in
+#: a file, so the file check alone reports a logged-in Mac user as having no
+#: credential. The lookup asks only whether the item exists — it never reads
+#: the secret, so it does not prompt for the Keychain password.
+_KEYCHAIN_SERVICES = {"claude_code": "Claude Code-credentials"}
 
 #: The smallest prompt that still proves the model answered.
 PROBE_PROMPT = "Reply with the single word: ok"
@@ -248,11 +276,12 @@ def check_llm(request: LlmCheckRequest) -> LlmCheckResult:
         "codex": _check_codex,
     }[planner]
 
+    # The budget is logged where it is resolved: the SDK backends shorten it
+    # when no credential is in sight, so it cannot be stated up front here.
     logger.info(
-        "checking planner %s (model=%s, timeout=%ds)",
+        "checking planner %s (model=%s)",
         planner,
         request.model or "<backend default>",
-        request.resolved_timeout_s(),
     )
     try:
         return checker(request)
@@ -289,6 +318,113 @@ def redact_secrets(text: str) -> str:
         if value and len(value) >= _MIN_SECRET_LEN and value in text:
             text = text.replace(value, f"<{env_name}>")
     return text
+
+
+def _has_cli_login(planner: str) -> bool:
+    """Whether a CLI login file exists for ``planner`` (best effort).
+
+    Args:
+        planner: The backend being probed.
+
+    Returns:
+        True when a known login file is present. False means "no evidence of
+        a login", not "not logged in": a backend may keep its credential
+        somewhere this module does not look.
+    """
+    for candidate in _CLI_LOGIN_FILES.get(planner, ()):
+        try:
+            if Path(candidate).expanduser().is_file():
+                return True
+        except OSError:
+            continue
+    return _has_keychain_login(planner)
+
+
+def _has_keychain_login(planner: str) -> bool:
+    """Whether the macOS Keychain holds a login item for ``planner``.
+
+    Existence only: the secret is never read, so no Keychain prompt appears.
+
+    Args:
+        planner: The backend being probed.
+
+    Returns:
+        True when the Keychain item exists. Always False off macOS.
+    """
+    service = _KEYCHAIN_SERVICES.get(planner)
+    if service is None or sys.platform != "darwin":
+        return False
+    try:
+        completed = subprocess.run(
+            ["security", "find-generic-password", "-s", service],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _sdk_probe_budget(request: LlmCheckRequest, *, no_credential: bool) -> int:
+    """Return the probe timeout, shortened when no credential was found.
+
+    An explicit ``--timeout-s`` always wins: the caller asked for a specific
+    budget and must not have it silently overridden.
+
+    Args:
+        request: The check being performed.
+        no_credential: Whether both the env var and the CLI login are absent.
+
+    Returns:
+        The timeout in seconds.
+    """
+    if request.timeout_s is not None:
+        budget = int(request.timeout_s)
+    elif no_credential:
+        budget = NO_CREDENTIAL_TIMEOUT_S
+    else:
+        budget = request.resolved_timeout_s()
+    logger.info(
+        "probe budget: %ds%s",
+        budget,
+        " (no credential env var or CLI login found)" if no_credential else "",
+    )
+    return budget
+
+
+def _sdk_timeout_verdict(
+    backend_label: str,
+    *,
+    credential_env: str,
+    no_credential: bool,
+    timeout_s: int,
+) -> tuple[str, str]:
+    """Explain an SDK probe timeout, naming a missing credential when likely.
+
+    A backend with no credential in sight never gets as far as the network,
+    so reporting the timeout as a network fault sends people to check their
+    connection instead of their key.
+
+    Args:
+        backend_label: Human-readable backend name for the message.
+        credential_env: The credential env var consulted for this backend.
+        no_credential: Whether both the env var and the CLI login are absent.
+        timeout_s: The budget that was spent.
+
+    Returns:
+        A ``(status, detail)`` pair.
+    """
+    if no_credential:
+        return (
+            STATUS_MISSING_API_KEY,
+            f"{credential_env} is not set and no CLI login was found; "
+            f"{backend_label} did not respond within {timeout_s}s.",
+        )
+    return (
+        STATUS_NETWORK_ERROR,
+        f"{backend_label} did not respond within {timeout_s}s.",
+    )
 
 
 def _describe(exc: BaseException) -> str:
@@ -367,6 +503,7 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
         return _result(STATUS_UNSUPPORTED_PROVIDER, detail=_describe(exc))
 
     timeout_s = request.resolved_timeout_s()
+    logger.info("probe budget: %ds", timeout_s)
     started = time.monotonic()
     try:
         reply = asyncio.run(
@@ -382,13 +519,8 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
             latency_s=round(time.monotonic() - started, 3),
         )
     except ModelHTTPError as exc:
-        status = (
-            STATUS_AUTH_FAILED
-            if exc.status_code in (401, 403)
-            else STATUS_PROVIDER_ERROR
-        )
         return _result(
-            status,
+            _classify_http_status(exc.status_code),
             detail=_describe(exc),
             latency_s=round(time.monotonic() - started, 3),
         )
@@ -419,6 +551,26 @@ async def _run_api_probe(agent_cls: Any, settings_cls: Any, api_model: Any) -> s
         model_settings=settings_cls(max_tokens=PROBE_MAX_TOKENS),
     )
     return str(result.output or "")
+
+
+def _classify_http_status(status_code: int | None) -> str:
+    """Map a provider HTTP status onto a check status.
+
+    Shared by the ``api`` planner's typed ``ModelHTTPError`` and the Claude
+    SDK's ``ResultMessage.api_error_status`` so both report one thing the
+    same way.
+
+    Args:
+        status_code: The HTTP status the provider returned, when known.
+
+    Returns:
+        The matching status constant.
+    """
+    if status_code in (401, 403):
+        return STATUS_AUTH_FAILED
+    if status_code == 400:
+        return STATUS_INVALID_MODEL
+    return STATUS_PROVIDER_ERROR
 
 
 def _classify_user_error(exc: Exception) -> str:
@@ -487,7 +639,8 @@ def _check_claude_code(request: LlmCheckRequest) -> LlmCheckResult:
     except ImportError as exc:
         return _result(STATUS_SDK_ERROR, detail=_describe(exc))
 
-    timeout_s = request.resolved_timeout_s()
+    no_credential = not key_present and not _has_cli_login("claude_code")
+    timeout_s = _sdk_probe_budget(request, no_credential=no_credential)
     started = time.monotonic()
     try:
         outcome = asyncio.run(
@@ -497,9 +650,15 @@ def _check_claude_code(request: LlmCheckRequest) -> LlmCheckResult:
             )
         )
     except (asyncio.TimeoutError, TimeoutError):
+        status, detail = _sdk_timeout_verdict(
+            "the Claude Agent SDK",
+            credential_env=_CLAUDE_CODE_KEY_ENV,
+            no_credential=no_credential,
+            timeout_s=timeout_s,
+        )
         return _result(
-            STATUS_NETWORK_ERROR,
-            detail=f"the Claude Agent SDK did not respond within {timeout_s}s.",
+            status,
+            detail=detail,
             latency_s=round(time.monotonic() - started, 3),
         )
     except Exception as exc:  # noqa: BLE001 - classified below
@@ -620,11 +779,7 @@ def _classify_claude_outcome(outcome: _ClaudeProbeOutcome) -> str | None:
             else STATUS_PROVIDER_ERROR
         )
     if outcome.api_error_status is not None:
-        return (
-            STATUS_AUTH_FAILED
-            if outcome.api_error_status in (401, 403)
-            else STATUS_PROVIDER_ERROR
-        )
+        return _classify_http_status(outcome.api_error_status)
     if not outcome.reply.strip():
         return STATUS_PROVIDER_ERROR
     return None
@@ -659,7 +814,8 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
     except ImportError as exc:
         return _result(STATUS_SDK_ERROR, detail=_describe(exc))
 
-    timeout_s = request.resolved_timeout_s()
+    no_credential = not key_present and not _has_cli_login("codex")
+    timeout_s = _sdk_probe_budget(request, no_credential=no_credential)
     started = time.monotonic()
     try:
         # Turn consumption and timeout/cleanup live in codex.py, next to the
@@ -671,9 +827,15 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
             timeout_s=timeout_s,
         )
     except (asyncio.TimeoutError, TimeoutError):
+        status, detail = _sdk_timeout_verdict(
+            "the Codex SDK",
+            credential_env=_CODEX_KEY_ENV,
+            no_credential=no_credential,
+            timeout_s=timeout_s,
+        )
         return _result(
-            STATUS_NETWORK_ERROR,
-            detail=f"the Codex SDK did not respond within {timeout_s}s.",
+            status,
+            detail=detail,
             latency_s=round(time.monotonic() - started, 3),
         )
     except Exception as exc:  # noqa: BLE001 - classified below
@@ -719,6 +881,18 @@ def _classify_sdk_error(exc: Exception, *, key_present: bool) -> str:
         for token in ("not logged in", "no credentials", "login", "api key")
     ):
         return STATUS_MISSING_API_KEY if not key_present else STATUS_AUTH_FAILED
+    if any(
+        token in text
+        for token in (
+            "model does not exist",
+            "unknown model",
+            "invalid model",
+            "model not found",
+        )
+    ) or re.search(r"\b400\b", text):
+        # Matched on wording first and the bare status second: "400" appears in
+        # timestamps, token counts, and model names, so it is the weaker signal.
+        return STATUS_INVALID_MODEL
     if any(
         token in text
         for token in ("connection", "dns", "resolve", "network", "unreachable", "tls")
