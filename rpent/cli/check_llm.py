@@ -24,11 +24,12 @@ from __future__ import annotations
 import argparse
 import json
 
-from rpent.planner.base import REASONING_EFFORTS
 from rpent.planner.check import (
+    BASE_URL_ENV_BY_PLANNER,
     CHECK_PLANNERS,
     DEFAULT_TIMEOUT_S,
     STATUS_AUTH_FAILED,
+    STATUS_INVALID_MODEL,
     STATUS_MISSING_API_KEY,
     STATUS_MISSING_CONFIG,
     STATUS_NETWORK_ERROR,
@@ -68,14 +69,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-url",
         default=None,
-        help="API base URL. Defaults to the selected backend's base URL env var.",
-    )
-    parser.add_argument(
-        "--reasoning-effort",
-        choices=REASONING_EFFORTS,
-        default="none",
-        help="Accepted for symmetry with the run CLI. The probe always uses "
-        "'none' so a thinking budget cannot consume the reply.",
+        help=(
+            "API base URL, for the 'api' planner only. claude_code and codex take their endpoint from ANTHROPIC_BASE_URL / CODEX_BASE_URL instead; passing this flag with either is an error rather than a silent no-op."
+        ),
     )
     parser.add_argument(
         "--timeout-s",
@@ -114,13 +110,17 @@ def _remediation(result: LlmCheckResult) -> str:
             "Use a provider RPent installs: anthropic:, openai:, or openai-chat:."
         ),
         STATUS_MISSING_API_KEY: f"Set {credential} in this shell, then retry.",
+        STATUS_INVALID_MODEL: (
+            f"The provider rejected the model id. Check that --model exists "
+            f"for this backend and that {credential} has access to it."
+        ),
         STATUS_AUTH_FAILED: (
             f"The provider rejected {credential}. Check the key, and that it "
             f"matches the endpoint in {base_url_env} / --base-url."
         ),
         STATUS_NETWORK_ERROR: (
-            f"Could not reach the provider. Check connectivity, any proxy, and "
-            f"the endpoint in {base_url_env} / --base-url."
+            f"Nothing answered in time. Check connectivity, any proxy, and the "
+            f"endpoint in {base_url_env} / --base-url."
         ),
         STATUS_PROVIDER_ERROR: (
             "The provider was reached but refused the request. Check the model "
@@ -176,7 +176,16 @@ def _render(result: LlmCheckResult) -> str:
 
 def main() -> int:
     """Run one connectivity check and report it. Returns 0 on success."""
-    args = _parser().parse_args()
+    parser = _parser()
+    args = parser.parse_args()
+    # Mirrors the run CLI: the flag reaches the api model only, so accepting
+    # it for the SDK backends would test an endpoint the run cannot use.
+    if args.base_url and args.planner in BASE_URL_ENV_BY_PLANNER:
+        parser.error(
+            "--base-url applies to the 'api' planner only; "
+            f"{args.planner} reads its endpoint from "
+            f"{BASE_URL_ENV_BY_PLANNER[args.planner]} instead"
+        )
     result = check_llm(
         LlmCheckRequest(
             planner=args.planner,

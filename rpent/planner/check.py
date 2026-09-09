@@ -28,8 +28,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from rpent.utils.logging import get_logger
@@ -50,6 +54,8 @@ STATUS_UNSUPPORTED_PROVIDER = "unsupported_provider"
 STATUS_MISSING_API_KEY = "missing_api_key"
 #: The provider rejected the credential (HTTP 401 / 403).
 STATUS_AUTH_FAILED = "auth_failed"
+#: The provider was reached and rejected the model id (HTTP 400).
+STATUS_INVALID_MODEL = "invalid_model"
 #: DNS, connection, TLS failure, or a timeout.
 STATUS_NETWORK_ERROR = "network_error"
 #: The provider was reached and refused (404, 429, 5xx, ...).
@@ -64,6 +70,7 @@ CHECK_STATUSES = (
     STATUS_UNSUPPORTED_PROVIDER,
     STATUS_MISSING_API_KEY,
     STATUS_AUTH_FAILED,
+    STATUS_INVALID_MODEL,
     STATUS_NETWORK_ERROR,
     STATUS_PROVIDER_ERROR,
     STATUS_SDK_ERROR,
@@ -72,8 +79,40 @@ CHECK_STATUSES = (
 #: Planner backends this module can probe.
 CHECK_PLANNERS = ("api", "claude_code", "codex")
 
+#: Backends whose endpoint comes from an env var, not from ``--base-url``.
+#: ``build_planner`` forwards ``base_url`` to the api model alone, so both
+#: CLIs reject the flag for these rather than dropping it silently — a check
+#: that honoured an endpoint the run ignores would be testing the wrong
+#: thing.
+BASE_URL_ENV_BY_PLANNER = {
+    "claude_code": "ANTHROPIC_BASE_URL",
+    "codex": "CODEX_BASE_URL",
+}
+
 #: Diagnostic timeouts, deliberately independent of the 1200s run default.
 DEFAULT_TIMEOUT_S = {"api": 30, "claude_code": 90, "codex": 90}
+
+#: Budget for an SDK backend running on a CLI login rather than an env var.
+#: Shorter than the default because a diagnostic should not hold the terminal
+#: for a minute and a half, but not much shorter: a cold Codex probe against a
+#: gateway was measured at 15.3s, so a budget near that turns a slow success
+#: into a false failure.
+CLI_LOGIN_TIMEOUT_S = 25
+
+#: Best-effort CLI login markers for the two child-process SDK backends. Both
+#: accept an interactive login instead of an env var, so absence is only a
+#: hint that no credential exists — never a verdict. It shortens the probe's
+#: budget; it never skips the probe.
+_CLI_LOGIN_FILES = {
+    "claude_code": ("~/.claude/.credentials.json",),
+    "codex": ("~/.codex/auth.json",),
+}
+
+#: macOS keeps the Claude Code credential in the login Keychain instead of in
+#: a file, so the file check alone reports a logged-in Mac user as having no
+#: credential. The lookup asks only whether the item exists — it never reads
+#: the secret, so it does not prompt for the Keychain password.
+_KEYCHAIN_SERVICES = {"claude_code": "Claude Code-credentials"}
 
 #: The smallest prompt that still proves the model answered.
 PROBE_PROMPT = "Reply with the single word: ok"
@@ -99,6 +138,7 @@ _API_BASE_URL_ENV = {
 #: Credential env vars for the two child-process SDK backends. Both accept an
 #: existing CLI login instead, so a missing var is reported but not fatal.
 _CLAUDE_CODE_KEY_ENV = "ANTHROPIC_API_KEY"
+_CLAUDE_CODE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 _CODEX_KEY_ENV = "CODEX_API_KEY"
 _CODEX_BASE_URL_ENV = "CODEX_BASE_URL"
 
@@ -248,11 +288,12 @@ def check_llm(request: LlmCheckRequest) -> LlmCheckResult:
         "codex": _check_codex,
     }[planner]
 
+    # The budget is logged where it is resolved: the SDK backends shorten it
+    # when no credential is in sight, so it cannot be stated up front here.
     logger.info(
-        "checking planner %s (model=%s, timeout=%ds)",
+        "checking planner %s (model=%s)",
         planner,
         request.model or "<backend default>",
-        request.resolved_timeout_s(),
     )
     try:
         return checker(request)
@@ -289,6 +330,80 @@ def redact_secrets(text: str) -> str:
         if value and len(value) >= _MIN_SECRET_LEN and value in text:
             text = text.replace(value, f"<{env_name}>")
     return text
+
+
+def _has_cli_login(planner: str) -> bool:
+    """Whether a CLI login file exists for ``planner`` (best effort).
+
+    Args:
+        planner: The backend being probed.
+
+    Returns:
+        True when a known login file is present. False means "no evidence of
+        a login", not "not logged in": a backend may keep its credential
+        somewhere this module does not look.
+    """
+    for candidate in _CLI_LOGIN_FILES.get(planner, ()):
+        try:
+            if Path(candidate).expanduser().is_file():
+                return True
+        except OSError:
+            continue
+    return _has_keychain_login(planner)
+
+
+def _has_keychain_login(planner: str) -> bool:
+    """Whether the macOS Keychain holds a login item for ``planner``.
+
+    Existence only: the secret is never read, so no Keychain prompt appears.
+
+    Args:
+        planner: The backend being probed.
+
+    Returns:
+        True when the Keychain item exists. Always False off macOS.
+    """
+    service = _KEYCHAIN_SERVICES.get(planner)
+    if service is None or sys.platform != "darwin":
+        return False
+    try:
+        completed = subprocess.run(
+            ["security", "find-generic-password", "-s", service],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _sdk_probe_budget(request: LlmCheckRequest, *, cli_login_only: bool) -> int:
+    """Return the probe timeout, shortened when only a CLI login backs it.
+
+    An explicit ``--timeout-s`` always wins: the caller asked for a specific
+    budget and must not have it silently overridden.
+
+    Args:
+        request: The check being performed.
+        cli_login_only: Whether the backend is running on a CLI login because
+            its credential env var is unset.
+
+    Returns:
+        The timeout in seconds.
+    """
+    if request.timeout_s is not None:
+        budget = int(request.timeout_s)
+    elif cli_login_only:
+        budget = CLI_LOGIN_TIMEOUT_S
+    else:
+        budget = request.resolved_timeout_s()
+    logger.info(
+        "probe budget: %ds%s",
+        budget,
+        " (running on a CLI login, no credential env var)" if cli_login_only else "",
+    )
+    return budget
 
 
 def _describe(exc: BaseException) -> str:
@@ -367,6 +482,7 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
         return _result(STATUS_UNSUPPORTED_PROVIDER, detail=_describe(exc))
 
     timeout_s = request.resolved_timeout_s()
+    logger.info("probe budget: %ds", timeout_s)
     started = time.monotonic()
     try:
         reply = asyncio.run(
@@ -382,13 +498,8 @@ def _check_api(request: LlmCheckRequest) -> LlmCheckResult:
             latency_s=round(time.monotonic() - started, 3),
         )
     except ModelHTTPError as exc:
-        status = (
-            STATUS_AUTH_FAILED
-            if exc.status_code in (401, 403)
-            else STATUS_PROVIDER_ERROR
-        )
         return _result(
-            status,
+            _classify_http_status(exc.status_code),
             detail=_describe(exc),
             latency_s=round(time.monotonic() - started, 3),
         )
@@ -419,6 +530,26 @@ async def _run_api_probe(agent_cls: Any, settings_cls: Any, api_model: Any) -> s
         model_settings=settings_cls(max_tokens=PROBE_MAX_TOKENS),
     )
     return str(result.output or "")
+
+
+def _classify_http_status(status_code: int | None) -> str:
+    """Map a provider HTTP status onto a check status.
+
+    Shared by the ``api`` planner's typed ``ModelHTTPError`` and the Claude
+    SDK's ``ResultMessage.api_error_status`` so both report one thing the
+    same way.
+
+    Args:
+        status_code: The HTTP status the provider returned, when known.
+
+    Returns:
+        The matching status constant.
+    """
+    if status_code in (401, 403):
+        return STATUS_AUTH_FAILED
+    if status_code == 400:
+        return STATUS_INVALID_MODEL
+    return STATUS_PROVIDER_ERROR
 
 
 def _classify_user_error(exc: Exception) -> str:
@@ -479,6 +610,8 @@ def _check_claude_code(request: LlmCheckRequest) -> LlmCheckResult:
             model=model,
             credential_env=_CLAUDE_CODE_KEY_ENV,
             credential_present=key_present,
+            base_url=os.environ.get(_CLAUDE_CODE_BASE_URL_ENV) or None,
+            base_url_env=_CLAUDE_CODE_BASE_URL_ENV,
             **kwargs,
         )
 
@@ -487,7 +620,15 @@ def _check_claude_code(request: LlmCheckRequest) -> LlmCheckResult:
     except ImportError as exc:
         return _result(STATUS_SDK_ERROR, detail=_describe(exc))
 
-    timeout_s = request.resolved_timeout_s()
+    if not key_present and not _has_cli_login("claude_code"):
+        # Nothing to authenticate with, so the probe can only time out. The
+        # env var alone is not enough to conclude this: both backends accept
+        # an interactive CLI login, which is why the login check is here too.
+        return _result(
+            STATUS_MISSING_API_KEY,
+            detail=f"{_CLAUDE_CODE_KEY_ENV} is not set and no CLI login was found.",
+        )
+    timeout_s = _sdk_probe_budget(request, cli_login_only=not key_present)
     started = time.monotonic()
     try:
         outcome = asyncio.run(
@@ -499,12 +640,16 @@ def _check_claude_code(request: LlmCheckRequest) -> LlmCheckResult:
     except (asyncio.TimeoutError, TimeoutError):
         return _result(
             STATUS_NETWORK_ERROR,
-            detail=f"the Claude Agent SDK did not respond within {timeout_s}s.",
+            detail=(
+                f"the Claude Agent SDK did not respond within {timeout_s}s. "
+                "The provider, the network, or the local CLI the SDK "
+                "runs could each cause this."
+            ),
             latency_s=round(time.monotonic() - started, 3),
         )
     except Exception as exc:  # noqa: BLE001 - classified below
         return _result(
-            _classify_sdk_error(exc, key_present=key_present),
+            _classify_sdk_error(exc, key_present=key_present, model=model),
             detail=_describe(exc),
             latency_s=round(time.monotonic() - started, 3),
         )
@@ -620,11 +765,7 @@ def _classify_claude_outcome(outcome: _ClaudeProbeOutcome) -> str | None:
             else STATUS_PROVIDER_ERROR
         )
     if outcome.api_error_status is not None:
-        return (
-            STATUS_AUTH_FAILED
-            if outcome.api_error_status in (401, 403)
-            else STATUS_PROVIDER_ERROR
-        )
+        return _classify_http_status(outcome.api_error_status)
     if not outcome.reply.strip():
         return STATUS_PROVIDER_ERROR
     return None
@@ -639,7 +780,7 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
     """Probe the Codex SDK with one turn and no MCP server attached."""
     model = (request.model or "").strip() or os.environ.get("CODEX_MODEL") or None
     key_present = bool(os.environ.get(_CODEX_KEY_ENV))
-    base_url = request.base_url or os.environ.get(_CODEX_BASE_URL_ENV) or None
+    base_url = os.environ.get(_CODEX_BASE_URL_ENV) or None
 
     def _result(status: str, **kwargs: Any) -> LlmCheckResult:
         return LlmCheckResult(
@@ -659,7 +800,15 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
     except ImportError as exc:
         return _result(STATUS_SDK_ERROR, detail=_describe(exc))
 
-    timeout_s = request.resolved_timeout_s()
+    if not key_present and not _has_cli_login("codex"):
+        # Nothing to authenticate with, so the probe can only time out. The
+        # env var alone is not enough to conclude this: both backends accept
+        # an interactive CLI login, which is why the login check is here too.
+        return _result(
+            STATUS_MISSING_API_KEY,
+            detail=f"{_CODEX_KEY_ENV} is not set and no CLI login was found.",
+        )
+    timeout_s = _sdk_probe_budget(request, cli_login_only=not key_present)
     started = time.monotonic()
     try:
         # Turn consumption and timeout/cleanup live in codex.py, next to the
@@ -673,12 +822,16 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
     except (asyncio.TimeoutError, TimeoutError):
         return _result(
             STATUS_NETWORK_ERROR,
-            detail=f"the Codex SDK did not respond within {timeout_s}s.",
+            detail=(
+                f"the Codex SDK did not respond within {timeout_s}s. "
+                "The provider, the network, or the local CLI the SDK "
+                "runs could each cause this."
+            ),
             latency_s=round(time.monotonic() - started, 3),
         )
     except Exception as exc:  # noqa: BLE001 - classified below
         return _result(
-            _classify_sdk_error(exc, key_present=key_present),
+            _classify_sdk_error(exc, key_present=key_present, model=model),
             detail=_describe(exc),
             latency_s=round(time.monotonic() - started, 3),
         )
@@ -693,7 +846,35 @@ def _check_codex(request: LlmCheckRequest) -> LlmCheckResult:
     return _result(STATUS_OK, reply=reply.strip(), latency_s=latency_s)
 
 
-def _classify_sdk_error(exc: Exception, *, key_present: bool) -> str:
+def _names_the_requested_model(text: str, model: str | None) -> bool:
+    """Whether a 4xx message echoes back the model id that was requested.
+
+    Gateways reword their model rejections freely: the same endpoint
+    answered one probe with ``is not available for this group`` and the
+    next, hours later, with ``is not supported by any configured account
+    in this group``. Chasing that wording is a losing game. What every one
+    of them does do is name the model it refused, so the model id plus a
+    4xx status is the stable signal.
+
+    Args:
+        text: The lower-cased error message.
+        model: The model id that was requested, when one was.
+
+    Returns:
+        True when a 4xx message contains the requested model id.
+    """
+    if not model or len(model) < 3:
+        # Too short to be distinctive; a bare "o3" would match by accident.
+        return False
+    return model.lower() in text
+
+
+def _classify_sdk_error(
+    exc: Exception,
+    *,
+    key_present: bool,
+    model: str | None = None,
+) -> str:
     """Classify a child-process SDK failure from its message.
 
     The Claude and Codex SDKs surface provider problems as SDK exceptions
@@ -702,6 +883,8 @@ def _classify_sdk_error(exc: Exception, *, key_present: bool) -> str:
     Args:
         exc: The exception raised by the SDK.
         key_present: Whether the backend's credential env var was set.
+        model: The model id that was requested, used to recognise a model
+            rejection without depending on the gateway's wording.
 
     Returns:
         The matching status constant.
@@ -726,4 +909,29 @@ def _classify_sdk_error(exc: Exception, *, key_present: bool) -> str:
         return STATUS_NETWORK_ERROR
     if any(token in text for token in ("429", "rate limit", "500", "502", "503")):
         return STATUS_PROVIDER_ERROR
+    # Everything the message could otherwise be about has now been excluded,
+    # so an error that names the very model that was requested is about that
+    # model. Backends word this three different ways and one of them carries
+    # no status code at all, which is why neither wording nor a 4xx can gate
+    # it.
+    if _names_the_requested_model(text, model):
+        return STATUS_INVALID_MODEL
+    if any(
+        token in text
+        for token in (
+            # Fallback for backends that refuse without echoing the id. Every
+            # phrase below was observed from a real backend, not guessed.
+            "model does not exist",
+            "unknown model",
+            "invalid model",
+            "model not found",
+            "is not available",
+            "unrecognized_model",
+            "unrecognized model",
+        )
+    ) or re.search(r"\b400\b", text):
+        # A bare 404 is deliberately NOT matched: a wrong base_url returns 404
+        # too, and calling that an invalid model would send people to change
+        # the one setting that was already correct.
+        return STATUS_INVALID_MODEL
     return STATUS_SDK_ERROR

@@ -192,6 +192,49 @@ def test_cli_json_output_is_parseable_and_matches_the_result(
     assert "hint" not in payload
 
 
+@pytest.mark.parametrize(
+    ("planner", "env_var"),
+    [("claude_code", "ANTHROPIC_BASE_URL"), ("codex", "CODEX_BASE_URL")],
+)
+def test_cli_rejects_base_url_for_the_backends_that_ignore_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    planner: str,
+    env_var: str,
+) -> None:
+    """A flag the run would drop must not be honoured by the check.
+
+    ``build_planner`` forwards ``base_url`` to the api model alone, so
+    accepting it here would test an endpoint the run never uses.
+    """
+    _stub_check(monkeypatch, LlmCheckResult(ok=True, status=STATUS_OK, planner=planner))
+
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, "--planner", planner, "--base-url", "https://gateway.example")
+
+    assert env_var in capsys.readouterr().err
+
+
+def test_cli_keeps_base_url_for_the_api_planner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _stub_check(
+        monkeypatch, LlmCheckResult(ok=True, status=STATUS_OK, planner="api")
+    )
+
+    _run(
+        monkeypatch,
+        "--planner",
+        "api",
+        "--model",
+        "anthropic:m",
+        "--base-url",
+        "https://gateway.example",
+    )
+
+    assert captured["request"].base_url == "https://gateway.example"
+
+
 def test_cli_rejects_an_unknown_planner_at_the_parser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
