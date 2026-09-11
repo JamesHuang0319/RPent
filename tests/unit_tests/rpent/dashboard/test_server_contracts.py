@@ -15,12 +15,15 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from rpent.dashboard.server import DashboardServer
+from rpent.dashboard.spec import DashboardSpec
+from rpent.dashboard.state import DashboardState
 from rpent.planner import check as check_mod
 from rpent.planner.check import (
     STATUS_AUTH_FAILED,
@@ -29,15 +32,29 @@ from rpent.planner.check import (
     LlmCheckResult,
 )
 
-DASHBOARD_SPEC: dict[str, Any] = {
-    "task": {"usage": "task"},
-    "frame_channels": [{"name": "camera", "label": "fixed camera"}],
-    "runtime_components": [],
+DASHBOARD_SPEC: DashboardSpec = {
+    "task": {
+        "command": "/rpent-task",
+        "usage": "/rpent-task <seed>",
+        "fields": ({"name": "seed", "kind": "integer", "minimum": 0},),
+        "display": "seed {seed}",
+        "output_slug": "s{seed}",
+    },
+    "runtime_components": (),
+    "frame_channels": (
+        {"name": "camera", "label": "fixed camera", "artifact": "frame.png"},
+    ),
+    "primitives": (),
 }
 
 
-def _server(**kwargs: Any) -> DashboardServer:
-    return DashboardServer(dashboard_spec=DASHBOARD_SPEC, **kwargs)
+@pytest.fixture
+def state(tmp_path: Path) -> DashboardState:
+    return DashboardState(output_dir=tmp_path, dashboard_spec=DASHBOARD_SPEC)
+
+
+def _server(state: DashboardState, **kwargs: Any) -> DashboardServer:
+    return DashboardServer(state=state, **kwargs)
 
 
 def _client(server: DashboardServer) -> TestClient:
@@ -59,7 +76,7 @@ def _stub_check(
 
 
 def test_check_route_returns_200_and_the_full_result_on_success(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, state: DashboardState
 ) -> None:
     result = LlmCheckResult(
         ok=True,
@@ -71,7 +88,7 @@ def test_check_route_returns_200_and_the_full_result_on_success(
     )
     _stub_check(monkeypatch, result)
 
-    resp = _client(_server()).post(
+    resp = _client(_server(state)).post(
         "/api/llm/check", json={"planner": "api", "model": "anthropic:m"}
     )
 
@@ -80,7 +97,7 @@ def test_check_route_returns_200_and_the_full_result_on_success(
 
 
 def test_a_failed_check_is_still_a_successful_request(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, state: DashboardState
 ) -> None:
     _stub_check(
         monkeypatch,
@@ -92,7 +109,7 @@ def test_a_failed_check_is_still_a_successful_request(
         ),
     )
 
-    resp = _client(_server()).post("/api/llm/check", json={"model": "anthropic:m"})
+    resp = _client(_server(state)).post("/api/llm/check", json={"model": "anthropic:m"})
 
     assert resp.status_code == 200
     body = resp.json()
@@ -102,33 +119,31 @@ def test_a_failed_check_is_still_a_successful_request(
 
 
 def test_server_side_base_url_is_merged_into_the_request(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, state: DashboardState
 ) -> None:
     captured = _stub_check(
         monkeypatch,
         LlmCheckResult(ok=True, status=STATUS_OK, planner="api"),
     )
-    server = _server(
-        llm_check_defaults={"planner": "codex", "base_url": "https://gw.example"}
-    )
+    server = _server(state, planner="codex", base_url="https://gw.example")
 
     _client(server).post("/api/llm/check", json={"planner": "api", "model": "a:b"})
 
     request = captured["request"]
-    # The form wins on planner/model; the server supplies what it cannot know.
+    # The request wins on planner/model; the server supplies what it cannot know.
     assert request.planner == "api"
     assert request.model == "a:b"
     assert request.base_url == "https://gw.example"
 
 
 def test_the_server_planner_default_applies_when_the_form_omits_it(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, state: DashboardState
 ) -> None:
     captured = _stub_check(
         monkeypatch,
         LlmCheckResult(ok=True, status=STATUS_OK, planner="codex"),
     )
-    server = _server(llm_check_defaults={"planner": "codex", "base_url": None})
+    server = _server(state, planner="codex")
 
     _client(server).post("/api/llm/check", json={})
 
@@ -136,13 +151,13 @@ def test_the_server_planner_default_applies_when_the_form_omits_it(
 
 
 def test_the_run_timeout_is_never_inherited_by_the_check(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, state: DashboardState
 ) -> None:
     captured = _stub_check(
         monkeypatch,
         LlmCheckResult(ok=True, status=STATUS_OK, planner="api"),
     )
-    server = _server(llm_check_defaults={"base_url": None, "timeout_s": 1200})
+    server = _server(state, planner="api")
 
     _client(server).post("/api/llm/check", json={"model": "a:b"})
 
@@ -152,7 +167,7 @@ def test_the_run_timeout_is_never_inherited_by_the_check(
 
 
 def test_a_concurrent_check_is_rejected_with_409(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, state: DashboardState
 ) -> None:
     entered = threading.Event()
     release = threading.Event()
@@ -163,7 +178,7 @@ def test_a_concurrent_check_is_rejected_with_409(
         return LlmCheckResult(ok=True, status=STATUS_OK, planner="api")
 
     monkeypatch.setattr(check_mod, "check_llm", blocking_check)
-    client = _client(_server())
+    client = _client(_server(state))
     responses: list[int] = []
 
     def first_call() -> None:
@@ -185,13 +200,13 @@ def test_a_concurrent_check_is_rejected_with_409(
 
 
 def test_the_lock_is_released_after_a_failing_check(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, state: DashboardState
 ) -> None:
     def exploding_check(request: LlmCheckRequest) -> LlmCheckResult:
         raise RuntimeError("boom")
 
     monkeypatch.setattr(check_mod, "check_llm", exploding_check)
-    server = _server()
+    server = _server(state)
     client = _client(server)
 
     with pytest.raises(RuntimeError):
@@ -202,8 +217,8 @@ def test_the_lock_is_released_after_a_failing_check(
     server._llm_check_lock.release()
 
 
-def test_healthz_still_reports_transport_liveness_only() -> None:
-    resp = _client(_server()).get("/healthz")
+def test_healthz_still_reports_transport_liveness_only(state: DashboardState) -> None:
+    resp = _client(_server(state)).get("/healthz")
 
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
